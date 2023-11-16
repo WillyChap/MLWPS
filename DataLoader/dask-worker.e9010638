@@ -1,0 +1,14 @@
+2023-11-15 18:49:49,824 - distributed.nanny - INFO -         Start Nanny at: 'tcp://128.117.208.83:36495'
+2023-11-15 18:49:59,365 - distributed.worker - INFO -       Start worker at: tcp://128.117.208.83:38925
+2023-11-15 18:49:59,368 - distributed.worker - INFO -          Listening to: tcp://128.117.208.83:38925
+2023-11-15 18:49:59,368 - distributed.worker - INFO -           Worker name:              PBSCluster-22
+2023-11-15 18:49:59,368 - distributed.worker - INFO -          dashboard at:       128.117.208.83:37837
+2023-11-15 18:49:59,369 - distributed.worker - INFO - Waiting to connect to: tcp://128.117.208.65:38731
+2023-11-15 18:49:59,369 - distributed.worker - INFO - -------------------------------------------------
+2023-11-15 18:49:59,369 - distributed.worker - INFO -               Threads:                          1
+2023-11-15 18:49:59,369 - distributed.worker - INFO -                Memory:                  23.28 GiB
+2023-11-15 18:49:59,369 - distributed.worker - INFO -       Local Directory: /glade/derecho/scratch/wchapman/tmp/dask-scratch-space/worker-ycplk0ve
+2023-11-15 18:49:59,369 - distributed.worker - INFO - -------------------------------------------------
+2023-11-15 18:50:02,506 - distributed.worker - INFO -         Registered to: tcp://128.117.208.65:38731
+2023-11-15 18:50:02,506 - distributed.worker - INFO - -------------------------------------------------
+2023-11-15 18:50:02,506 - distributed.core - INFO - Starting established connection to tcp://128.117.208.65:38731

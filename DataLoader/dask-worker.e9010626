@@ -1,0 +1,15 @@
+2023-11-15 18:50:06,308 - distributed.nanny - INFO -         Start Nanny at: 'tcp://128.117.208.78:42147'
+2023-11-15 18:50:08,349 - distributed.worker - INFO -       Start worker at: tcp://128.117.208.78:33983
+2023-11-15 18:50:08,350 - distributed.worker - INFO -          Listening to: tcp://128.117.208.78:33983
+2023-11-15 18:50:08,350 - distributed.worker - INFO -           Worker name:              PBSCluster-16
+2023-11-15 18:50:08,350 - distributed.worker - INFO -          dashboard at:       128.117.208.78:46495
+2023-11-15 18:50:08,350 - distributed.worker - INFO - Waiting to connect to: tcp://128.117.208.65:38731
+2023-11-15 18:50:08,350 - distributed.worker - INFO - -------------------------------------------------
+2023-11-15 18:50:08,350 - distributed.worker - INFO -               Threads:                          1
+2023-11-15 18:50:08,350 - distributed.worker - INFO -                Memory:                  23.28 GiB
+2023-11-15 18:50:08,350 - distributed.worker - INFO -       Local Directory: /glade/derecho/scratch/wchapman/tmp/dask-scratch-space/worker-6tlg9qkj
+2023-11-15 18:50:08,350 - distributed.worker - INFO - -------------------------------------------------
+2023-11-15 18:50:13,261 - distributed.worker - INFO -         Registered to: tcp://128.117.208.65:38731
+2023-11-15 18:50:13,262 - distributed.worker - INFO - -------------------------------------------------
+2023-11-15 18:50:13,262 - distributed.core - INFO - Starting established connection to tcp://128.117.208.65:38731
+2023-11-15 18:59:47,556 - distributed.core - INFO - Event loop was unresponsive in Worker for 3.27s.  This is often caused by long-running GIL-holding functions or moving large chunks of data. This can cause timeouts and instability.
