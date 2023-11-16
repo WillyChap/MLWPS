@@ -1,0 +1,5 @@
+# Exclude dask-worker files
+dask-worker.*
+
+# Exclude ipynb checkpoints
+.ipynb_checkpoints/
