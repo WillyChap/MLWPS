@@ -210,12 +210,12 @@ def get_zarr_chunk_sequences(
 
 
 
-
-
-
 @dataclass
 class ERA5Dataset(torch.utils.data.IterableDataset):
+    
+    
     zarr_chunk_sequences: Iterable[Segment]  #: Defines multiple Zarr chunks to be loaded from disk at once.
+    filename: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.zarr'
     history_len: int = 1  #: The number of timesteps of 'history' to load.
     forecast_len: int = 2  #: The number of timesteps of 'forecast' to load.
     transform: Optional[Callable] = None
@@ -224,6 +224,9 @@ class ERA5Dataset(torch.utils.data.IterableDataset):
     max_n_samples_per_disk_load: int = 2_000  #: Max number of disk loader.  Actual number is chosen randomly between min & max.
     n_zarr_chunk_sequences_to_load_at_once: int = 8  #: Number of chunk seqs to load at once.  These are sampled at random.
     
+    #def __init__(self,filename):
+    #    self.filename: filename
+    
     def __post_init__(self):
         #: Total sequence length of each sample.
         self.total_seq_len = self.history_len + self.forecast_len
@@ -231,7 +234,7 @@ class ERA5Dataset(torch.utils.data.IterableDataset):
     def per_worker_init(self, worker_id: int) -> None:
         """Called by worker_init_fn on each copy of SatelliteDataset after the worker process has been spawned."""
         self.worker_id = worker_id
-        self.data_array = get_forward_data(filename=ZARR)
+        self.data_array = get_forward_data(filename=self.filename)
         # Each worker must have a different seed for its random number generator.
         # Otherwise all the workers will output exactly the same data!
         seed = torch.initial_seed()
