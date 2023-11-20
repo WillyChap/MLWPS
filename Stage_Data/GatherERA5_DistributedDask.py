@@ -16,7 +16,7 @@ import re
 
 #### settings !!! MODIFY THIS BLOCK
 start_date = '2010-01-01'
-end_date = '2010-02-03' #make sure this date is after the start date... 
+end_date = '2011-01-02' #make sure this date is after the start date... 
 interval_hours = 1 #what hour interval would you like to get? [i.e: 1 = 24 files/day, 6 = 4 files/day]
 FPout = '/glade/derecho/scratch/wchapman/STAGING/' #where do you want the files stored?
 prefix_out = 'ERA5_e5.oper.ml.v3' #what prefix do you want the files stored with?
@@ -34,7 +34,7 @@ else:
 from distributed import Client
 from dask_jobqueue import PBSCluster
 
-cluster = PBSCluster(project='NAML0001',walltime='02:00:00',cores=1, memory='70GB',shared_temp_directory='/glade/scratch/wchapman/tmp',queue='main')
+cluster = PBSCluster(project='NAML0001',walltime='06:00:00',cores=1, memory='70GB',shared_temp_directory='/glade/scratch/wchapman/tmp',queue='casper')
 cluster.scale(jobs=40)
 client = Client(cluster)
 #client
@@ -223,6 +223,7 @@ def make_nc_files_optimized(files_dict, Dateswanted, Dayswanted, FPout, prefix_o
         datstr = str(dw)[:4] + str(dw)[5:7] + str(dw)[8:10]
         out_file_uvtq = FPout + '/' + prefix_out + '.uvtq.' + datstr + '.nc'
         delayed_write_uvtq = delayed(DS.squeeze().to_netcdf)(out_file_uvtq)
+        #delayed_write_uvtq = delayed(write_to_netcdf)(DS.squeeze(),out_file_uvtq)
         log_files.append(out_file_uvtq)
         delayed_writes.append(delayed_write_uvtq)
         
@@ -249,6 +250,8 @@ def make_nc_files_optimized(files_dict, Dateswanted, Dayswanted, FPout, prefix_o
 
     return delayed_writes,log_files
 
+def write_to_netcdf(ds, filename):
+    ds.to_netcdf(filename, engine='h5netcdf')
 
 def find_strings_by_pattern(string_list, pattern):
     """
@@ -426,6 +429,7 @@ if __name__ == '__main__':
             print('loaded')
             
             delayed_write_uvtq = delayed(DSall.squeeze().to_netcdf)(outtot)
+            #delayed_write_uvtq = delayed(write_to_netcdf)(DSall.squeeze(),outtot)
             delayed_writes.append(delayed_write_uvtq)
             elapsed_time = time.time() - start_time
             print(f" phase executed in {elapsed_time} seconds")
