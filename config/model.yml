@@ -1,0 +1,45 @@
+save_loc: "./"
+seed: 1000
+
+trainer:
+    mode: fsdp 
+    train_batch_size: 32
+    valid_batch_size: 32
+    learning_rate: 1e-3
+    weight_decay: 0.0
+    start_epoch: 0
+    epochs: 100
+    amp: false
+    grad_accum_every: 4
+    apply_grad_penalty: true
+
+model:
+    image_height: 640
+    patch_height: 64
+    image_width: 1280
+    patch_width: 64
+    frames: 60
+    frame_patch_size: 20
+    channels: 5
+    dim: 128
+    layers: 4
+    dim_head: 30
+    mlp_dim: 30
+    heads: 8
+    depth: 4
+    vq_codebook_dim: 128
+    vq_codebook_size: 65536  # 2^16
+    vq_entropy_loss_weight: 0.8
+    vq_diversity_gamma: 1.0
+    discr_layers: 4
+    
+pbs:
+  script_name: "gwm"
+  select: "select:1:ncpus=32:ngpus=4:mem=480GB"
+  walltime: "12:00:00"
+  account: "NAML0001"
+  queue: "main"
+  out_path: "{save_loc}/out"
+  err_path: "{save_loc}/out"
+  bash: "module load conda; conda activate holodec"
+  num_workers: 4
