@@ -63,6 +63,16 @@ class CheckForBadData():
                 raise ValueError(f'\n{attr_name} has negative values at {image.time.values}')
         return sample
 
+class Normalize():
+    def __call(self, smaple:Sample)->Sample:
+        mean_ds = xr.open_dataset('/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.mean.nc')
+        std_ds = xr.open_dataset('/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.std.nc')
+        for key, value in sample.items():
+            if isinstance(value, xr.Dataset):
+                key_change = key
+                value_change = (value - mean_ds)/std_ds
+                sample[key]=value_change
+        return sample
 
 class ToTensor():
     def __call__(self, sample: Sample) -> Sample:
