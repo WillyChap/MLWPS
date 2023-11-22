@@ -140,7 +140,7 @@ def trainer(rank, world_size, conf, trial=False):
     amp = conf['trainer']['amp']
     grad_accum_every = conf['trainer']['grad_accum_every']
     apply_grad_penalty = conf['trainer']['apply_grad_penalty']
-    max_norm = conf['trainer']['grad_max_norm']
+    thread_workers = conf['trainer']['thread_workers']
 
     # Model conf settings 
     image_height = conf['model']['image_height']
@@ -195,7 +195,7 @@ def trainer(rank, world_size, conf, trial=False):
                               shuffle=False, 
                               sampler=sampler_tr, 
                               pin_memory=True, 
-                              num_workers=0,
+                              num_workers=thread_workers,
                               drop_last=True)
     
     test_loader = torch.utils.data.DataLoader(test_dataset, 
@@ -203,7 +203,7 @@ def trainer(rank, world_size, conf, trial=False):
                               shuffle=False, 
                               sampler=sampler_val, 
                               pin_memory=True, 
-                              num_workers=0)
+                              num_workers=thread_workers)
     
     # cycle for later so we can accum grad dataloader
     dl = cycle(train_loader)
@@ -289,7 +289,7 @@ def trainer(rank, world_size, conf, trial=False):
         train_disc_loss = []
 
         # set up a custom tqdm
-        batches_per_epoch = 100 #len(train_loader)
+        batches_per_epoch = 2 #len(train_loader)
         batch_group_generator = tqdm.tqdm(
             range(batches_per_epoch), total=batches_per_epoch, leave=True
         )
@@ -299,46 +299,27 @@ def trainer(rank, world_size, conf, trial=False):
             # update generator 
             model.train()
 
+            # logs
+
+            logs = {}
+
             # update vae (generator)
 
-            # Step 1
-            batch = next(dl)
+            for _ in range(grad_accum_every):
+                batch = next(dl)
+                x = batch["x"].to(device)
+                y1 = batch["y1"].to(device)
+                
+                with autocast(enabled=amp):
+                    loss = model(
+                        x,
+                        y1,
+                        return_loss=True,
+                        add_gradient_penalty=apply_grad_penalty
+                    )
+                    scaler.scale(loss / grad_accum_every).backward()
 
-            with autocast(enabled=amp):
-                loss, y1_pred = model(
-                    batch["x"].to(device),
-                    batch["y1"].to(device),
-                    return_loss=True,
-                    return_recons=True,
-                    add_gradient_penalty=apply_grad_penalty
-                )
-                scaler.scale(loss / grad_accum_every).backward()
-
-            # clip grads
-            torch.nn.utils.clip_grad_norm_(vae_parameters, max_norm=max_norm)
-            
-            if distributed:
-                torch.distributed.barrier()
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-
-            batch_loss = torch.Tensor([loss.item()]).cuda(device)
-            dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
-            results_dict["train_loss_0"].append(batch_loss[0].item())
-
-            # Step 2
-            with autocast(enabled=amp):
-                loss = model(
-                    y1_pred.detach(),
-                    batch["y2"].to(device),
-                    return_loss=True,
-                    add_gradient_penalty=apply_grad_penalty
-                )
-                scaler.scale(loss / grad_accum_every).backward()
-
-            # clip grads
-            torch.nn.utils.clip_grad_norm_(vae_parameters, max_norm=max_norm)
+                accum_log(logs, {'loss': loss.item() / grad_accum_every})
 
             if distributed:
                 torch.distributed.barrier()
@@ -346,9 +327,9 @@ def trainer(rank, world_size, conf, trial=False):
             scaler.update()
             optimizer.zero_grad()
 
-            batch_loss = torch.Tensor([loss.item()]).cuda(device)
+            batch_loss = torch.Tensor([logs["loss"]]).cuda(device)
             dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
-            results_dict["train_loss_1"].append(batch_loss[0].item())
+            results_dict["train_loss"].append(batch_loss[0].item())
             
             # update discriminator
 
@@ -384,10 +365,9 @@ def trainer(rank, world_size, conf, trial=False):
             #     np.mean(results_dict["train_loss"]), 
             #     np.mean(results_dict["train_disc_loss"])
             # )
-            to_print = "Epoch {} train_loss_0: {:.6f} train_loss_1: {:.6f}".format(
+            to_print = "Epoch {} train_loss: {:.6f}".format(
                 epoch, 
-                np.mean(results_dict["train_loss_0"]),
-                np.mean(results_dict["train_loss_1"])
+                np.mean(results_dict["train_loss"])
             )
             to_print += " lr: {:.12f}".format(optimizer.param_groups[0]["lr"])
             batch_group_generator.set_description(to_print)
@@ -409,16 +389,12 @@ def trainer(rank, world_size, conf, trial=False):
 
             valid_loss = []
             for k, batch in batch_group_generator:
-                
-                loss, y1_pred = model(
-                    batch["x"].to(device),
-                    batch["y1"].to(device),
-                    return_loss=True,
-                    return_recons=True
-                )
+                # move to device
+                x = batch["x"].to(device)
+                y1 = batch["y1"].to(device)
 
-                loss += model(
-                    y1_pred.detach(),
+                loss = model(
+                    x,
                     y1,
                     return_loss=True
                 )
@@ -426,7 +402,8 @@ def trainer(rank, world_size, conf, trial=False):
                 # update tqdm
                 batch_loss = torch.Tensor([loss]).cuda(device)
                 dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
-                valid_loss.append(batch_loss[0])
+                
+                valid_loss.append(batch_loss[0].item())
                 to_print = "Epoch {} valid_loss: {:.6f}".format(
                     epoch, np.mean(valid_loss)
                 )
@@ -436,6 +413,8 @@ def trainer(rank, world_size, conf, trial=False):
                 if k >= valid_batches_per_epoch and k > 0:
                     break
                     
+            valid_loss.append(valid_loss)
+
             # Shutdown the progbar
             batch_group_generator.close()
 
@@ -447,13 +426,21 @@ def trainer(rank, world_size, conf, trial=False):
             if not np.isfinite(np.mean(valid_loss)):
                 raise optuna.TrialPruned()  
                 
+        # Filter out non-float and NaN values from train_loss
+        train_loss = [v for v in train_loss if isinstance(v, float) and np.isfinite(v)]
+
+        # Filter out non-float and NaN values from valid_loss
+        valid_loss = [v for v in valid_loss if isinstance(v, float) and np.isfinite(v)]
+      
         # Put things into a results dictionary -> dataframe
         results_dict["epoch"].append(epoch)
-        results_dict["train_loss_0"].append(np.mean(results_dict["train_loss_0"]))
-        results_dict["train_loss_1"].append(np.mean(results_dict["train_loss_1"]))
+        results_dict["train_loss"].append(np.mean(train_loss))
         #results_dict["train_disc_loss"].append(np.mean(train_disc_loss))
         results_dict["valid_loss"].append(np.mean(valid_loss))
         results_dict["learning_rate"].append(optimizer.param_groups[0]["lr"])
+        
+        print(results_dict)
+        
         df = pd.DataFrame.from_dict(results_dict).reset_index()
 
         # Save the model if its the best so far.

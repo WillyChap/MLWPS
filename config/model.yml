@@ -1,30 +1,36 @@
-save_loc: "./"
+save_loc: "./results"
 seed: 1000
+
+
+data:
+    save_loc: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.zarr'
 
 trainer:
     mode: fsdp 
-    train_batch_size: 32
-    valid_batch_size: 32
-    learning_rate: 1e-3
+    train_batch_size: 1
+    valid_batch_size: 1
+    learning_rate: 1.0e-05
     weight_decay: 0.0
     start_epoch: 0
     epochs: 100
-    amp: false
-    grad_accum_every: 4
-    apply_grad_penalty: true
+    amp: False
+    grad_accum_every: 1
+    apply_grad_penalty: False
+    grad_max_norm: 1.0
+    thread_workers: 8
 
 model:
     image_height: 640
     patch_height: 64
     image_width: 1280
     patch_width: 64
-    frames: 60
-    frame_patch_size: 20
-    channels: 5
+    frames: 15
+    frame_patch_size: 5
+    channels: 4
     dim: 128
-    layers: 4
-    dim_head: 30
-    mlp_dim: 30
+    layers: 2
+    dim_head: 128
+    mlp_dim: 128
     heads: 8
     depth: 4
     vq_codebook_dim: 128

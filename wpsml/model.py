@@ -49,12 +49,24 @@ class Attention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim = -1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
 
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        # dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
+        # attn = self.attend(dots)
+        # attn = self.dropout(attn)
 
-        out = torch.matmul(attn, v)
+        # out = torch.matmul(attn, v)
+
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=True, 
+            enable_math=False, 
+            enable_mem_efficient=False
+        ):
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask = None,
+                dropout_p = 0.0
+            )
+
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
 
@@ -182,6 +194,7 @@ def hinge_gen_loss(fake):
     return -fake.mean()
 
 def grad_layer_wrt_loss(loss, layer):
+    return 1.0
     return torch_grad(
         outputs = loss,
         inputs = layer,
@@ -197,6 +210,15 @@ def bce_discr_loss(fake, real):
 
 def bce_gen_loss(fake):
     return -log(torch.sigmoid(fake)).mean()
+
+def gradient_penalty(images, output, weight = 10):
+    batch_size = images.shape[0]
+    gradients = torch_grad(outputs = output, inputs = images,
+                           grad_outputs = torch.ones(output.size(), device = images.device),
+                           create_graph = True, retain_graph = True, only_inputs = True)[0]
+
+    gradients = rearrange(gradients, 'b ... -> b (...)')
+    return weight * ((gradients.norm(2, dim = 1) - 1) ** 2).mean()
 
 
 class VQGanVAE(nn.Module):
@@ -339,18 +361,44 @@ class VQGanVAE(nn.Module):
         # whether to return discriminator loss
 
         if return_discr_loss:
-            assert exists(self.discr), 'discriminator must exist to train it'
+            assert self.discr is not None, 'discriminator must exist to train it'
 
-            fmap.detach_()
-            img.requires_grad_()
+            #fmap.detach_()
+            #img.requires_grad_()
+            
+            # Initialize an empty list to store discriminator losses for each level
+            discr_losses = []
 
-            fmap_discr_logits, img_discr_logits = map(self.discr, (fmap, img))
+            for i in range(img.size(2)):
+                img_frame = img[:, :, i, :, :]
+                fmap_frame = fmap[:, :, i, :, :]
 
-            discr_loss = self.discr_loss(fmap_discr_logits, img_discr_logits)
+                img_frame.requires_grad_()
+                fmap_frame.requires_grad_()
 
-            if add_gradient_penalty:
-                gp = gradient_penalty(img, img_discr_logits)
-                loss = discr_loss + gp
+                fmap_discr_logits, img_discr_logits = map(self.discr, (fmap_frame, img_frame))
+
+                discr_loss = self.discr_loss(fmap_discr_logits, img_discr_logits)
+
+                if add_gradient_penalty:
+                    gp = gradient_penalty(img_frame, img_discr_logits)
+                    loss = discr_loss + gp
+                else:
+                    loss = discr_loss
+
+                # Append the discriminator loss for the current level to the list
+                discr_losses.append(loss)
+
+            # Sum the accumulated discriminator losses along the third dimension
+            loss = torch.mean(torch.stack(discr_losses))
+    
+            #fmap_discr_logits, img_discr_logits = map(self.discr, (fmap, img))
+
+            #discr_loss = self.discr_loss(fmap_discr_logits, img_discr_logits)
+
+            #if add_gradient_penalty:
+            #    gp = gradient_penalty(img, img_discr_logits)
+            #    loss = discr_loss + gp
 
             if return_recons:
                 return loss, fmap
@@ -370,35 +418,63 @@ class VQGanVAE(nn.Module):
         # perceptual loss
         img_vgg_input = img
         fmap_vgg_input = fmap
-        
-        # in the dall-e example, there are no frames (pressure levels). here we loop over them and sum the losses
+
+        # in the dall-e example, there are no frames (pressure levels). here we reshape instead of loop over levels
+        # first get the vae loss
         loss = recon_loss + commit_loss
-        for i in range(img_vgg_input.shape[2]):
-            # Get the i-th frame from the original and reconstructed videos
-            img_frame = img_vgg_input[:, :, i, :, :]
-            fmap_frame = fmap_vgg_input[:, :, i, :, :]
 
-            # Compute VGG features for the original and reconstructed frames
-            img_vgg_feats = self.vgg(img_frame)
-            recon_vgg_feats = self.vgg(fmap_frame)
+        # Reshape inputs
+        num_channels = img_vgg_input.shape[1]
+        num_frames = img_vgg_input.shape[2]
+        height = img_vgg_input.shape[3]
+        width = img_vgg_input.shape[4]
 
-            # Compute the perceptual loss (MSE loss between VGG features)
-            perceptual_loss = F.mse_loss(img_vgg_feats, recon_vgg_feats)
+        img_vgg_input_reshaped = img_vgg_input.permute(0, 2, 1, 3, 4).contiguous().view(-1, num_channels, height, width)
+        fmap_vgg_input_reshaped = fmap_vgg_input.permute(0, 2, 1, 3, 4).contiguous().view(-1, num_channels, height, width)
+        
+        # Compute VGG features for the original and reconstructed frames
+        img_vgg_feats = self.vgg(img_vgg_input_reshaped)
+        recon_vgg_feats = self.vgg(fmap_vgg_input_reshaped)
+        
+        # Compute the perceptual loss (MSE loss between VGG features)
+        perceptual_loss = F.mse_loss(img_vgg_feats, recon_vgg_feats)
+        
+        # Combine losses
+        loss += perceptual_loss
 
-            # generator loss
-            gen_loss = self.gen_loss(self.discr(fmap_frame))
+        # # perceptual loss
+        # img_vgg_input = img
+        # fmap_vgg_input = fmap
+        
+        # # in the dall-e example, there are no frames (pressure levels). here we loop over them and sum the losses
+        # loss = recon_loss + commit_loss
+        # for i in range(img_vgg_input.shape[2]):
+        #     # Get the i-th frame from the original and reconstructed videos
+        #     img_frame = img_vgg_input[:, :, i, :, :]
+        #     fmap_frame = fmap_vgg_input[:, :, i, :, :]
 
-            # calculate adaptive weight
-            last_dec_layer = self.enc_dec.last_dec_layer
-            norm_grad_wrt_gen_loss = grad_layer_wrt_loss(gen_loss, last_dec_layer).norm(p = 2)
-            norm_grad_wrt_perceptual_loss = grad_layer_wrt_loss(perceptual_loss, last_dec_layer).norm(p = 2)
+        #     # Compute VGG features for the original and reconstructed frames
+        #     img_vgg_feats = self.vgg(img_frame)
+        #     recon_vgg_feats = self.vgg(fmap_frame)
 
-            #print(norm_grad_wrt_perceptual_loss, norm_grad_wrt_gen_loss)
-            adaptive_weight = safe_div(norm_grad_wrt_perceptual_loss, norm_grad_wrt_gen_loss)
-            adaptive_weight.clamp_(max = 1e4)
+        #     # Compute the perceptual loss (MSE loss between VGG features)
+        #     perceptual_loss = F.mse_loss(img_vgg_feats, recon_vgg_feats)
 
-            # combine losses
-            loss += (perceptual_loss + adaptive_weight * gen_loss)
+        #     #print(i, perceptual_loss)
+        #     # generator loss
+        #     #gen_loss = self.gen_loss(self.discr(fmap_frame))
+
+        #     # calculate adaptive weight
+        #     #last_dec_layer = self.enc_dec.last_dec_layer
+        #     #norm_grad_wrt_gen_loss = 1.0 #grad_layer_wrt_loss(gen_loss, last_dec_layer).norm(p = 2)
+        #     #norm_grad_wrt_perceptual_loss = 1.0 #grad_layer_wrt_loss(perceptual_loss, last_dec_layer).norm(p = 2)
+
+        #     #print(norm_grad_wrt_perceptual_loss, norm_grad_wrt_gen_loss)
+        #     #adaptive_weight = safe_div(norm_grad_wrt_perceptual_loss, norm_grad_wrt_gen_loss)
+        #     #adaptive_weight.clamp_(max = 1e4)
+
+        #     # combine losses
+        #     loss += perceptual_loss #(perceptual_loss + adaptive_weight * gen_loss)
 
         if return_recons:
             return loss, fmap
