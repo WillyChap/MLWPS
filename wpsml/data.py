@@ -64,13 +64,15 @@ class CheckForBadData():
         return sample
 
 class Normalize():
-    def __call(self, smaple:Sample)->Sample:
-        mean_ds = xr.open_dataset('/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.mean.nc')
-        std_ds = xr.open_dataset('/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.std.nc')
+    def __init__(self,mean_file,std_file):
+        self.mean_ds = xr.open_dataset(mean_file)
+        self.std_ds = xr.open_dataset(std_file)
+
+    def __call__(self, sample:Sample)->Sample:
         for key, value in sample.items():
             if isinstance(value, xr.Dataset):
                 key_change = key
-                value_change = (value - mean_ds)/std_ds
+                value_change = (value - self.mean_ds)/self.std_ds
                 sample[key]=value_change
         return sample
 

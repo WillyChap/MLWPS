@@ -168,6 +168,7 @@ def trainer(rank, world_size, conf, trial=False):
     train_dataset = ERA5Dataset(
         filename=conf["data"]["save_loc"],
         transform=transforms.Compose([
+            Normalize(conf["data"]["mean_path"],conf["data"]["std_path"]),
             ToTensor(),
         ]),
     )
