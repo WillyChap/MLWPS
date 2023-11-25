@@ -13,17 +13,30 @@ import xarray as xr
 from dask import delayed
 from dask.diagnostics import ProgressBar
 import re
+import argparse
+
+
+####
+#example use:
+#python GatherERA5_DistributedDask_toZarr.py --start_date 2011-01-01 --end_date 2012-01-01
+#####
+
+
+## model levels to pressure levels: 
+#https://confluence.ecmwf.int/display/CKB/ERA5%3A+compute+pressure+and+geopotential+on+model+levels%2C+geopotential+height+and+geometric+height?preview=/158636068/226495690/levels_137.png
 
 #### settings !!! MODIFY THIS BLOCK
-start_date = '2011-01-01'
-end_date = '2011-01-02' #make sure this date is after the start date... 
+#start_date = '2011-01-01' #these arguements are now passed to the program. 
+#end_date = '2012-01-01' #make sure this date is after the start date... 
 interval_hours = 1 #what hour interval would you like to get? [i.e: 1 = 24 files/day, 6 = 4 files/day]
 FPout = '/glade/derecho/scratch/wchapman/STAGING/' #where do you want the files stored?
 prefix_out = 'ERA5_e5.oper.ml.v3' #what prefix do you want the files stored with?
-project_num = 'NAML0001'
-print('try this')
+project_num = 'NAML0001' #what project key dfo you have? 
+remove_dask_worker_scripts = True
 #### settings !!! MODIFY THIS BLOCK
 
+
+print('...setting up dask client...')
 if 'client' in locals():
     client.shutdown()
     print('...shutdown client...')
@@ -40,8 +53,16 @@ client = Client(cluster)
 #client
 
 
-# ##dask NCAR client: 
+# Function to parse command-line arguments
+def parse_args():
+    parser = argparse.ArgumentParser(description='Your script description here.')
+    parser.add_argument('--start_date', required=True, help='Start date in the format YYYY-MM-DD')
+    parser.add_argument('--end_date', required=True, help='End date in the format YYYY-MM-DD')
+    # Add other arguments as needed
+    args = parser.parse_args()
+    return args
 
+# ##dask NCAR client: 
 # assert that dates wanted > 0
 
 def find_strings_with_substring(string_list, substring):
@@ -222,27 +243,12 @@ def make_nc_files_optimized(files_dict, Dateswanted, Dayswanted, FPout, prefix_o
         
         datstr = str(dw)[:4] + str(dw)[5:7] + str(dw)[8:10]
         out_file_uvtq = FPout + '/' + prefix_out + '.uvtq.' + datstr + '.nc'
-        delayed_write_uvtq = delayed(DS.squeeze().to_netcdf)(out_file_uvtq)
-        #delayed_write_uvtq = delayed(write_to_netcdf)(DS.squeeze(),out_file_uvtq)
+        #delayed_write_uvtq = delayed(DS.squeeze().to_netcdf)(out_file_uvtq)
+        delayed_write_uvtq = delayed(write_to_netcdf)(DS.squeeze(),out_file_uvtq)
         log_files.append(out_file_uvtq)
         delayed_writes.append(delayed_write_uvtq)
         
-        
-        #for ee, tt in enumerate(DS['time']):
-        #    print('running time: ',ee)
-        #    hourdo = DS['time.hour'][ee]
-        #    datstr = str(dw)[:4] + str(dw)[5:7] + str(dw)[8:10] + f'{hourdo:02}'
-        #    
-        #    #this works:
-        #    out_file_uvtq = FPout + '/' + prefix_out + '.uvtq.' + datstr + '.nc'
-        #    delayed_write_uvtq = delayed(DS.sel(time=tt).squeeze().to_netcdf)(out_file_uvtq)
-        #    delayed_writes.append(delayed_write_uvtq)
-        #    
-        #    #try:
-        #    #out_file_uvtq = FPout + '/' + prefix_out + '.uvtq.' + datstr + '.npy'
-        #    #delayed_write_uvtq = delayed(np.save)(out_file_uvtq, (DS.sel(time=tt).squeeze().to_array()))
-        #    #delayed_writes.append(delayed_write_uvtq)
-
+      
     # Compute the delayed write operations concurrently
     print('writing')
     with ProgressBar():
@@ -251,7 +257,8 @@ def make_nc_files_optimized(files_dict, Dateswanted, Dayswanted, FPout, prefix_o
     return delayed_writes,log_files
 
 def write_to_netcdf(ds, filename):
-    ds.to_netcdf(filename, engine='h5netcdf')
+    print(filename)
+    ds.to_netcdf(filename, engine="netcdf4")
 
 def find_strings_by_pattern(string_list, pattern):
     """
@@ -285,10 +292,12 @@ def find_strings_by_pattern(string_list, pattern):
 def divide_datetime_index(date_index, max_items_per_division=30):
     """
     Divide a DatetimeIndex into sublists with a maximum number of items per division.
+    This prevents the dask machines from trying to write all the files at once and 
+    restricts it to the max_items_per_division
 
     Parameters:
     - date_index: DatetimeIndex to be divided.
-    - max_items_per_division: Maximum number of items per division (default is 4).
+    - max_items_per_division: Maximum number of items per division (default is 30).
 
     Returns:
     - divided_lists: List of sublists.
@@ -344,15 +353,70 @@ def increment_date_by_one_day(date_str):
 
     return incremented_date_str
 
+
+def find_staged_files(start_date,end_date):
+    """
+    Generates a list of file paths based on a date range.
+
+    Parameters:
+    - start_date (str): The start date of the range in the format 'YYYY-MM-DD'.
+    - end_date (str): The end date of the range in the format 'YYYY-MM-DD'.
+
+    Returns:
+    - files_ (list): List of file paths corresponding to each date in the range.
+    """
+    
+    # Generate a daily date range between start_date and end_date
+    date_range_daily=pd.date_range(start_date,end_date)
+    # List to store file paths
+    files_ = []
+
+    # Iterate through each date in the range
+    for dtdt in date_range_daily:
+        d_file = FPout+prefix_out+'.uvtq.'+str(dtdt)[:10].replace('-','')+'.nc'
+        files_.append(d_file)
+        
+        # Check if the file exists; raise an error if not
+        if not os.path.exists(d_file):
+            raise FileNotFoundError(f"File not found: {d_file}")   
+    return files_
+
+
 # Function to load and add a new dimension
 def load_and_add_dimension(file_path):
+    """
+    Load data from a given file and add a new dimension.
+
+    Parameters:
+    - file_path (str): The path to the file containing the data.
+
+    Returns:
+    - data (numpy.ndarray): The loaded data with an added dimension at the beginning.
+    """
     data = np.load(file_path)
     return data[np.newaxis, ...]  # Add a new dimension at the beginning
 
 def flatten_list(list_of_lists):
+    """
+    Flatten a list of lists.
+
+    Parameters:
+    - list_of_lists (list): A list containing sublists.
+
+    Returns:
+    - flattened_list (list): A flattened list containing all elements from sublists.
+    """
     return [item for sublist in list_of_lists for item in sublist]
 
 if __name__ == '__main__':
+     # Parse command-line arguments
+    args = parse_args()
+    # Extract start_date and end_date from the arguments
+    start_date = args.start_date
+    end_date = args.end_date
+    # ... (rest of your script)
+    print(f'Start date: {start_date}')
+    print(f'End date: {end_date}')
     
     print('here we go')
     ##look at all the dates:
@@ -402,7 +466,7 @@ if __name__ == '__main__':
     
     
     delayed_writes = []
-    for yryr in np.arange(1979,2040):
+    for yryr in np.arange(1979,2100):
         yryrstr = str(np.char.zfill(str(yryr),4))
         for momo in np.arange(1,13):
             start_time = time.time()  # Record the start time
@@ -428,9 +492,9 @@ if __name__ == '__main__':
             DSall = xr.open_mfdataset(matching_strings,parallel=True)
             print('loaded')
             
-            delayed_write_uvtq = delayed(DSall.squeeze().to_netcdf)(outtot)
-            #delayed_write_uvtq = delayed(write_to_netcdf)(DSall.squeeze(),outtot)
-            delayed_writes.append(delayed_write_uvtq)
+            #delayed_write_uvtq = delayed(DSall.squeeze().to_netcdf)(outtot)
+            delayed_write_uvtq = delayed(write_to_netcdf)(DSall.squeeze(),outtot)
+            #delayed_writes.append(delayed_write_uvtq)
             elapsed_time = time.time() - start_time
             print(f" phase executed in {elapsed_time} seconds")
             
@@ -438,15 +502,36 @@ if __name__ == '__main__':
     print('...writing monthly files...')
     with ProgressBar():
         delayed_writes = list(dask.compute(*delayed_writes))
+        
+        
+        
+    print('zarr-ifying the files:')
+    files_ = find_staged_files(start_date,end_date)
+    DS = xr.open_mfdataset(files_,parallel=True)
+    
+    
+    ##Add Surface and UL variables.... 
+    #in this block.
+    #/glade/campaign/collections/rda/data/ds633.0/
+    ##
+    
+    print('opened')
+    DS = DS.chunk({'time':10})
+    print('chunked')
+    print('send to zarr')
+    yrz = start_date[:4]
+    DS.to_zarr(FPout+'All_'+yrz+'_staged.zarr')
+    print('...finished...')
            
     if 'client' in locals():
         client.shutdown()
         print('...shutdown client...')
     else:
         print('client does not exist yet')     
-        
-    print('removing dask workers')
-    fns_rm = sorted(glob.glob('./dask_worker*'))
-    print(len(fns_rm))
-    for fn in fns_rm: 
-        os.remove(fn)
+    
+    if remove_dask_worker_scripts:
+        print('...removing dask workers...')
+        fns_rm = sorted(glob.glob('./dask-worker*'))
+        print(len(fns_rm))
+        for fn in fns_rm: 
+            os.remove(fn)
