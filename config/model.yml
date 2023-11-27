@@ -1,20 +1,22 @@
-save_loc: "./results/pickle"
+save_loc: "./results/ddp"
 seed: 1000
 
 
 data:
+    variables: ['U','V','T','Q']
+    surface_variables: ['SP','t2m','V500','U500','T500','Z500','Q500']
     save_loc: '/glade/derecho/scratch/wchapman/STAGING/TOTAL_*'
     mean_path: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.SLO.mean.nc'
     std_path: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.SLO.std.nc'
 
 trainer:
     mode: ddp
-    train_batch_size: 2
-    valid_batch_size: 2
+    train_batch_size: 4
+    valid_batch_size: 4
     learning_rate: 1.0e-04
     weight_decay: 0.0
     start_epoch: 0
-    epochs: 1
+    epochs: 1000
     amp: False
     grad_accum_every: 1
     apply_grad_penalty: False
@@ -36,6 +38,7 @@ model:
     mlp_dim: 1024
     heads: 8
     depth: 4
+    use_codebook: False
     vq_codebook_dim: 128
     vq_codebook_size: 65536  # 2^16
     vq_entropy_loss_weight: 0.8

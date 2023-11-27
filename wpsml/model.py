@@ -70,23 +70,23 @@ class Attention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim = -1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
 
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        # dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
+        # attn = self.attend(dots)
+        # attn = self.dropout(attn)
 
-        out = torch.matmul(attn, v)
+        # out = torch.matmul(attn, v)
 
-        # with torch.backends.cuda.sdp_kernel(
-        #     enable_flash=True, 
-        #     enable_math=False, 
-        #     enable_mem_efficient=True
-        # ):
-        #     out = F.scaled_dot_product_attention(
-        #         q, k, v,
-        #         attn_mask = None,
-        #         dropout_p = 0.0
-        #     )
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=True, 
+            enable_math=False, 
+            enable_mem_efficient=True
+        ):
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask = None,
+                dropout_p = 0.0
+            )
 
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
@@ -587,6 +587,94 @@ class VQGanVAE(nn.Module):
         return loss
 
 
+# class ViTEncDecSurface(nn.Module):
+#     def __init__(
+#         self,
+#         image_height, 
+#         patch_height,
+#         image_width,
+#         patch_width,
+#         frames, 
+#         frame_patch_size,
+#         dim,
+#         channels = 4,
+#         surface_channels = 7,
+#         depth = 4,
+#         heads = 8,
+#         dim_head = 32,
+#         mlp_dim = 32
+#     ):
+#         super().__init__()
+        
+#         num_patches = (image_height // patch_height) * (image_width // patch_width) * (frames // frame_patch_size)
+#         input_dim = channels * patch_height * patch_width * frame_patch_size
+#         input_dim_surface = surface_channels * patch_height * patch_width
+        
+#         self.transformer_encoder = Transformer(
+#             dim = dim,
+#             depth = depth,
+#             dim_head = dim_head,
+#             heads = heads,
+#             mlp_dim = mlp_dim
+#         )
+        
+#         self.transformer_decoder = Transformer(
+#             dim = dim,
+#             depth = depth,
+#             dim_head = dim_head,
+#             heads = heads,
+#             mlp_dim = mlp_dim
+#         )
+        
+#         self.encoder = nn.Sequential(
+#             Rearrange('b c (f pf) (h p1) (w p2) -> b (f h w) (p1 p2 pf c)', p1 = patch_height, p2 = patch_width, pf = frame_patch_size),
+#             nn.Linear(input_dim, dim),
+#             self.transformer_encoder,
+#              #Rearrange('b (f h w) c -> b c f h w', h = patch_height, w = patch_width)
+#         )
+        
+#         self.encoder_surface = nn.Sequential(
+#             Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width, c = surface_channels),
+#             nn.Linear(input_dim_surface, dim),
+#             self.transformer_encoder,
+#              #Rearrange('b (f h w) c -> b c f h w', h = patch_height, w = patch_width)
+#         )
+        
+#         self.decoder = nn.Sequential(
+#             #Rearrange('b c f h w -> b (f h w) c'),
+#             self.transformer_decoder,
+#             nn.Sequential(
+#                 nn.Linear(dim, dim * 4, bias = False),
+#                 nn.Tanh(),
+#                 nn.Linear(dim * 4, input_dim, bias = False),
+#             ),
+#             Rearrange('b (f h w) (p1 p2 pf c) -> b c (pf f) (p1 h) (w p2)', 
+#                       h = (image_height // patch_height), f = (frames // frame_patch_size), p1 = patch_height, p2 = patch_width, pf = frame_patch_size)
+#         )
+        
+#         self.decoder_surface = nn.Sequential(
+#             #Rearrange('b c f h w -> b (f h w) c'),
+#             self.transformer_decoder,
+#             nn.Sequential(
+#                 nn.Linear(dim, dim * 4, bias = False),
+#                 nn.Tanh(),
+#                 nn.Linear(dim * 4, input_dim_surface, bias = False),
+#             ),
+#             Rearrange('b (h w) (p1 p2 c) -> b c (p1 h) (w p2)', w = (image_width // patch_width),
+#                       c = surface_channels, p1 = patch_height, p2 = patch_width)
+#         )
+
+#     def encode(self, x, x_surf):
+#         encoded = self.encoder(x)
+#         encoded_surf = self.encoder_surface(x_surf)
+#         return encoded, encoded_surf
+
+#     def decode(self, x, x_surf):
+#         decoded = self.decoder(x)
+#         decoded_surf = self.decoder_surface(x_surf)
+#         return decoded, decoded_surf
+    
+    
 class ViTEncDecSurface(nn.Module):
     def __init__(
         self,
@@ -604,12 +692,10 @@ class ViTEncDecSurface(nn.Module):
         dim_head = 32,
         mlp_dim = 32
     ):
+                 
         super().__init__()
-        
-        num_patches = (image_height // patch_height) * (image_width // patch_width) * (frames // frame_patch_size)
-        input_dim = channels * patch_height * patch_width * frame_patch_size
-        input_dim_surface = surface_channels * patch_height * patch_width
-        
+
+        # Encoder-decoder layers 
         self.transformer_encoder = Transformer(
             dim = dim,
             depth = depth,
@@ -617,7 +703,6 @@ class ViTEncDecSurface(nn.Module):
             heads = heads,
             mlp_dim = mlp_dim
         )
-        
         self.transformer_decoder = Transformer(
             dim = dim,
             depth = depth,
@@ -626,53 +711,56 @@ class ViTEncDecSurface(nn.Module):
             mlp_dim = mlp_dim
         )
         
-        self.encoder = nn.Sequential(
-            Rearrange('b c (f pf) (h p1) (w p2) -> b (f h w) (p1 p2 pf c)', p1 = patch_height, p2 = patch_width, pf = frame_patch_size),
-            nn.Linear(input_dim, dim),
-            self.transformer_encoder,
-             #Rearrange('b (f h w) c -> b c f h w', h = patch_height, w = patch_width)
-        )
+        # Input/output dimensions
+        num_patches = (image_height // patch_height) * (image_width // patch_width) * (frames // frame_patch_size)  
+        input_dim = channels * patch_height * patch_width * frame_patch_size
+        input_dim_surface = surface_channels * patch_height * patch_width
         
-        self.encoder_surface = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width, c = surface_channels),
-            nn.Linear(input_dim_surface, dim),
-            self.transformer_encoder,
-             #Rearrange('b (f h w) c -> b c f h w', h = patch_height, w = patch_width)
-        )
+        # Encoder layers 
+        self.encoder_embed = Rearrange('b c (f pf) (h p1) (w p2) -> b (f h w) (p1 p2 pf c)', p1=patch_height, p2=patch_width, pf=frame_patch_size)
+        self.encoder_linear = nn.Linear(input_dim, dim)
         
-        self.decoder = nn.Sequential(
-            #Rearrange('b c f h w -> b (f h w) c'),
-            self.transformer_decoder,
-            nn.Sequential(
-                nn.Linear(dim, dim * 4, bias = False),
-                nn.Tanh(),
-                nn.Linear(dim * 4, input_dim, bias = False),
-            ),
-            Rearrange('b (f h w) (p1 p2 pf c) -> b c (pf f) (p1 h) (w p2)', 
-                      h = (image_height // patch_height), f = (frames // frame_patch_size), p1 = patch_height, p2 = patch_width, pf = frame_patch_size)
-        )
+        self.encoder_surface_embed = Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_height, p2=patch_width, c=surface_channels) 
+        self.encoder_surface_linear = nn.Linear(input_dim_surface, dim)
         
-        self.decoder_surface = nn.Sequential(
-            #Rearrange('b c f h w -> b (f h w) c'),
-            self.transformer_decoder,
-            nn.Sequential(
-                nn.Linear(dim, dim * 4, bias = False),
-                nn.Tanh(),
-                nn.Linear(dim * 4, input_dim_surface, bias = False),
-            ),
-            Rearrange('b (h w) (p1 p2 c) -> b c (p1 h) (w p2)', w = (image_width // patch_width),
-                      c = surface_channels, p1 = patch_height, p2 = patch_width)
-        )
-
+        # Decoder layers
+        self.decoder_linear_1 = nn.Linear(dim, dim * 4)
+        self.decoder_linear_2 = nn.Linear(dim * 4, input_dim)
+        self.decoder_rearrange = Rearrange('b (f h w) (p1 p2 pf c) -> b c (pf f) (p1 h) (w p2)',  
+                                           h=(image_height // patch_height), f=(frames // frame_patch_size),  
+                                           p1=patch_height, p2=patch_width, pf=frame_patch_size)
+                                           
+        self.decoder_surface_linear_1 = nn.Linear(dim, dim * 4)
+        self.decoder_surface_linear_2 = nn.Linear(dim * 4, input_dim_surface)
+        self.decoder_surface_rearrange = Rearrange('b (h w) (p1 p2 c) -> b c (p1 h) (w p2)',  
+                                                   w=(image_width // patch_width), c=surface_channels,  
+                                                   p1=patch_height, p2=patch_width)
+                                                   
     def encode(self, x, x_surf):
-        encoded = self.encoder(x)
-        encoded_surf = self.encoder_surface(x_surf)
-        return encoded, encoded_surf
-
+        x = self.encoder_embed(x)
+        x = self.encoder_linear(x)  
+        x = self.transformer_encoder(x)
+        
+        x_surf = self.encoder_surface_embed(x_surf)
+        x_surf = self.encoder_surface_linear(x_surf)
+        x_surf = self.transformer_encoder(x_surf)  
+        
+        return x, x_surf
+    
     def decode(self, x, x_surf):
-        decoded = self.decoder(x)
-        decoded_surf = self.decoder_surface(x_surf)
-        return decoded, decoded_surf
+        x = self.transformer_decoder(x)
+        x = self.decoder_linear_1(x) 
+        x = F.tanh(x)
+        x = self.decoder_linear_2(x)
+        x = self.decoder_rearrange(x)
+        
+        x_surf = self.transformer_decoder(x_surf) 
+        x_surf = self.decoder_surface_linear_1(x_surf)
+        x_surf = F.tanh(x_surf)
+        x_surf = self.decoder_surface_linear_2(x_surf)
+        x_surf = self.decoder_surface_rearrange(x_surf)
+        
+        return x, x_surf
     
 
 class ViTEncoderDecoder(nn.Module):

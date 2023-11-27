@@ -1,11 +1,14 @@
+import warnings
+warnings.filterwarnings("ignore")
+
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data.distributed import DistributedSampler
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import functools
 #from echo.src.base_objective import BaseObjective
 
-# from holodecml.seed import seed_everything
 from collections import defaultdict
 from argparse import ArgumentParser
 from pathlib import Path
@@ -17,20 +20,20 @@ import torch.fft
 import logging
 import shutil
 import random
-import psutil
+
 import optuna
 import wandb
-import time
 import tqdm
+import glob
 import os
 import gc
 import sys
 import yaml
-import warnings
 
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     CPUOffload,
     BackwardPrefetch,
@@ -40,18 +43,12 @@ from torch.distributed.fsdp.wrap import (
     enable_wrap,
     wrap,
 )
-
-import xarray as xr
 from torchvision import transforms
-from wpsml.model import VQGanVAE
-from wpsml.data import ERA5Dataset, ToTensor #get_forward_data, get_contiguous_segments, get_zarr_chunk_sequences,ERA5Dataset,ToTensor,worker_init_fn, ERA5Dataset2
-#from typing import Optional, Callable, TypedDict, Union, Iterable, Tuple, NamedTuple, List
-#from torchvision import transforms
-#import pytorch_lightning as pl
+from wpsml.model import ViTEncoderDecoder
+from wpsml.data import ERA5Dataset, ToTensor, Normalize 
+import joblib
+import flash
 
-
-
-warnings.filterwarnings("ignore")
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
@@ -117,6 +114,37 @@ def launch_pbs_jobs(config):
     print(jobid)
     os.remove("launcher.sh")
     
+    
+class SimpleModel(nn.Module):
+    def __init__(self, color_dim, surface_dim):
+        super(SimpleModel, self).__init__()
+
+        # Shared layers
+        self.conv = nn.Conv3d(color_dim, 64, kernel_size=3, stride=1, padding=1)
+        self.relu = nn.ReLU()
+
+        # Color prediction head
+        self.conv_transpose_color = nn.ConvTranspose3d(64, color_dim, kernel_size=3, stride=1, padding=1)
+        self.loss_fn_color = nn.MSELoss()
+
+        # Surface detail prediction head
+        self.conv_transpose_surface = nn.ConvTranspose2d(1, surface_dim, kernel_size=3, stride=1, padding=1)  # Using ConvTranspose2d for 2D prediction
+        self.loss_fn_surface = nn.MSELoss()
+
+    def forward(self, x, x_surface, y, y_surface):
+        # Process 3D input
+        x = self.conv(x)
+        x = self.relu(x)
+        x = self.conv_transpose_color(x)
+        loss = self.loss_fn_color(x, y)
+
+        # Process 2D input
+        x_surface = self.conv_transpose_surface(x_surface)  # Add channel dimension
+        x_surface = x_surface.squeeze(1)  # Remove channel dimension after prediction
+        loss_surface = self.loss_fn_surface(x_surface, y_surface)
+
+        return x, x_surface, loss+loss_surface
+
 
 def trainer(rank, world_size, conf, trial=False):
     if conf["trainer"]["mode"] in ["fsdp", "ddp"]:
@@ -126,11 +154,14 @@ def trainer(rank, world_size, conf, trial=False):
         distributed = False
     
     # infer device id from rank
+    
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}") if torch.cuda.is_available() else torch.device("cpu")
     torch.cuda.set_device(rank % torch.cuda.device_count())
     
     # Config settings
+    
     seed = 1000
+    save_loc = conf['save_loc']
     train_batch_size = conf['trainer']['train_batch_size']
     valid_batch_size = conf['trainer']['valid_batch_size']
     learning_rate = conf['trainer']['learning_rate']
@@ -141,8 +172,10 @@ def trainer(rank, world_size, conf, trial=False):
     grad_accum_every = conf['trainer']['grad_accum_every']
     apply_grad_penalty = conf['trainer']['apply_grad_penalty']
     thread_workers = conf['trainer']['thread_workers']
+    stopping_patience = conf['trainer']['stopping_patience']
 
     # Model conf settings 
+    
     image_height = conf['model']['image_height']
     image_width = conf['model']['image_width']
     patch_height = conf['model']['patch_height']
@@ -150,7 +183,6 @@ def trainer(rank, world_size, conf, trial=False):
     frames = conf['model']['frames']
     frame_patch_size = conf['model']['frame_patch_size']
     
-    channels = conf['model']['channels']
     dim = conf['model']['dim']
     layers = conf['model']['layers']
     dim_head = conf['model']['dim_head']
@@ -164,18 +196,31 @@ def trainer(rank, world_size, conf, trial=False):
     vq_diversity_gamma = conf['model']['vq_diversity_gamma']
     discr_layers = conf['model']['discr_layers']
     
-    # datasets (zarr reader)
+    # Data vars
+    channels = len(conf["data"]["variables"])
+    surface_channels = len(conf["data"]["surface_variables"])
+    
+    # datasets (zarr reader) 
+    all_ERA_files = sorted(glob.glob(conf["data"]["save_loc"]))
+    
     train_dataset = ERA5Dataset(
-        filename=conf["data"]["save_loc"],
+        filenames=all_ERA_files[1:len(all_ERA_files)-1],
         transform=transforms.Compose([
             Normalize(conf["data"]["mean_path"],conf["data"]["std_path"]),
             ToTensor(),
         ]),
     )
     
-    test_dataset = train_dataset
+    valid_dataset = ERA5Dataset(
+        filenames=all_ERA_files[0:1],
+        transform=transforms.Compose([
+            Normalize(conf["data"]["mean_path"],conf["data"]["std_path"]),
+            ToTensor(),
+        ]),
+    )
     
     # setup the distributed sampler
+    
     sampler_tr = DistributedSampler(train_dataset,
                              num_replicas=world_size,
                              rank=rank,
@@ -183,7 +228,7 @@ def trainer(rank, world_size, conf, trial=False):
                              seed=seed, 
                              drop_last=True)
     
-    sampler_val = DistributedSampler(test_dataset,
+    sampler_val = DistributedSampler(valid_dataset,
                              num_replicas=world_size,
                              rank=rank,
                              seed=seed, 
@@ -191,6 +236,7 @@ def trainer(rank, world_size, conf, trial=False):
                              drop_last=True)
     
     # setup the dataloder for this process
+    
     train_loader = torch.utils.data.DataLoader(train_dataset, 
                               batch_size=train_batch_size, 
                               shuffle=False, 
@@ -199,7 +245,7 @@ def trainer(rank, world_size, conf, trial=False):
                               num_workers=thread_workers,
                               drop_last=True)
     
-    test_loader = torch.utils.data.DataLoader(test_dataset, 
+    valid_loader = torch.utils.data.DataLoader(valid_dataset, 
                               batch_size=valid_batch_size, 
                               shuffle=False, 
                               sampler=sampler_val, 
@@ -207,90 +253,155 @@ def trainer(rank, world_size, conf, trial=False):
                               num_workers=thread_workers)
     
     # cycle for later so we can accum grad dataloader
+    
     dl = cycle(train_loader)
-    valid_dl = cycle(test_loader)
+    valid_dl = cycle(valid_loader)
     
-    # model 
-    vae = VQGanVAE(
-        image_height,
-        patch_height,
-        image_width,
-        patch_width,
-        frames,
-        frame_patch_size,
-        dim,
-        channels,
-        depth,
-        heads,
-        dim_head,
-        mlp_dim,
-        vq_codebook_dim=vq_codebook_dim,
-        vq_codebook_size=vq_codebook_size,
-        vq_entropy_loss_weight=vq_entropy_loss_weight,
-        vq_diversity_gamma=vq_diversity_gamma,
-        discr_layers=discr_layers
-    ).to(device)
+    if start_epoch > 0:
+        with open(f"{save_loc}/best.pkl", "rb") as f:
+            loaded_objects = joblib.load(f)
 
-    num_params = sum(p.numel() for p in vae.parameters())
-    print(f"Number of parameters in the model: {num_params}")
-
-    # have to send the module to the correct device first
-    vae.to(device)
-    #vae = torch.compile(vae)
-    
-    # will not check that the device is correct here
-    if conf["trainer"]["mode"] == "fsdp":
-        auto_wrap_policy = functools.partial(
-            size_based_auto_wrap_policy, min_num_params=100_000 #1_000_000
-        )
-        
-        model = FSDP(
-            vae, 
-            use_orig_params=True,
-            auto_wrap_policy=auto_wrap_policy,
-            mixed_precision=torch.distributed.fsdp.MixedPrecision(
-                param_dtype=torch.float16, 
-                reduce_dtype=torch.float16, 
-                buffer_dtype=torch.float16, 
-                cast_forward_inputs=True
+        model = loaded_objects["model"].to(device)
+        if conf["trainer"]["mode"] == "fsdp":
+            auto_wrap_policy = functools.partial(
+                size_based_auto_wrap_policy, min_num_params=1_000_000
             )
-        )
-    elif conf["trainer"]["mode"] == "ddp":
-        model = DDP(vae, device_ids=[device], output_device=None)
+            model = FSDP(
+                model,
+                use_orig_params=True,
+                auto_wrap_policy=auto_wrap_policy,
+                mixed_precision=torch.distributed.fsdp.MixedPrecision(
+                    param_dtype=torch.float16, 
+                    reduce_dtype=torch.float16, 
+                    buffer_dtype=torch.float16, 
+                    cast_forward_inputs=True
+                ),
+                #sharding_strategy=ShardingStrategy.FULL_SHARD # Zero3. Zero2 = ShardingStrategy.SHARD_GRAD_OP
+            )
+        elif conf["trainer"]["mode"] == "ddp":
+            model = DDP(model, device_ids=[device], output_device=None)
+        else:
+            model = model
+        
+        optimizer = loaded_objects["optimizer"]
+        scheduler = loaded_objects["scheduler"]
+        scaler = loaded_objects["scaler"]
+        start_epoch = loaded_objects["epoch"] + 1
+        learning_rate = loaded_objects["learning_rate"]
+        
+        # make sure the loaded optimizer is on the same device as the reloaded model
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+        
     else:
-        model = vae
     
-    # Optimizer for ViT and for D
-    all_parameters = set(model.parameters())
-    discr_parameters = set(model.discr.parameters())
-    vae_parameters = all_parameters - discr_parameters
+        # model 
+        vae = ViTEncoderDecoder(
+            image_height, 
+            patch_height, 
+            image_width,
+            patch_width,
+            frames, 
+            frame_patch_size,
+            dim,
+            channels,
+            surface_channels,
+            depth,
+            heads,
+            dim_head,
+            mlp_dim
+        ) 
 
-    # adam with weight decay
-    optimizer = torch.optim.AdamW(vae_parameters, lr=learning_rate, weight_decay=weight_decay)
-    #discr_optim = torch.optim.AdamW(discr_parameters, lr=learning_rate, weight_decay=weight_decay)
+        num_params = sum(p.numel() for p in vae.parameters())
+        if rank == 0:
+            logging.info(f"Number of parameters in the model: {num_params}")
+            
+        #summary(vae, input_size=(channels, height, width))
 
-    # grad scalers
-    scaler = GradScaler(enabled=amp)
-    #discr_scaler = GradScaler(enabled=amp)
+        # have to send the module to the correct device first
+        vae.to(device)
+        #vae = torch.compile(vae)
 
-    # Load a learning rate scheduler
-    lr_scheduler = ReduceLROnPlateau(
-        optimizer,
-        patience=1,
-        min_lr=1.0e-13,
-        verbose=True
-    )
+        if start_epoch > 0:
+            # Load weights
+            if rank == 0:
+                logging.info(f"Restarting training at epoch {start_epoch}")
+                logging.info(f"Loading model weights from {save_loc}")
+            checkpoint = torch.load(
+                os.path.join(save_loc, "best.pt"),
+                map_location=lambda storage, loc: storage,
+            )
+            vae.load_state_dict(checkpoint["model_state_dict"])    
 
+        # will not check that the device is correct here
+        if conf["trainer"]["mode"] == "fsdp":
+            auto_wrap_policy = functools.partial(
+                size_based_auto_wrap_policy, min_num_params=1_000_000
+            )
+            # maybe try transformer_auto_wrap_policy instead ... 
+
+            model = FSDP(
+                vae,
+                use_orig_params=True,
+                auto_wrap_policy=auto_wrap_policy,
+                mixed_precision=torch.distributed.fsdp.MixedPrecision(
+                    param_dtype=torch.float16, 
+                    reduce_dtype=torch.float16, 
+                    buffer_dtype=torch.float16, 
+                    cast_forward_inputs=True
+                ),
+                #sharding_strategy=ShardingStrategy.FULL_SHARD # Zero3. Zero2 = ShardingStrategy.SHARD_GRAD_OP
+            )
+        elif conf["trainer"]["mode"] == "ddp":
+            model = DDP(vae, device_ids=[device], output_device=None)
+        else:
+            model = vae
+
+        # Load an optimizer, gradient scaler, and learning rate scheduler, the optimizer must come after wrapping model using FSDP
+        #optimizer = flash.core.optimizers.LARS(model.parameters(), lr=1.5, momentum=0.9, weight_decay=1e-2)
+        optimizer = torch.optim.AdamW(set(model.parameters()), lr=learning_rate, weight_decay=weight_decay)
+
+        if conf["trainer"]["mode"] == "fsdp":
+            scaler = ShardedGradScaler(enabled=amp)
+        else:
+            scaler = GradScaler(enabled=amp)
+
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            patience=1,
+            min_lr=1.0e-13,
+            verbose=True
+        )
+    
+        # load optimizer and grad scaler states
+        if start_epoch > 0 and rank == 0:
+            logging.info(f"Loading optimizer, grad scaler, and learning rate scheduler states from {save_loc}")
+        
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+    # Reload the results saved in the training csv if continuing to train
+    if start_epoch == 0:
+        results_dict = defaultdict(list)
+    else:
+        results_dict = defaultdict(list)
+        saved_results = pd.read_csv(f"{save_loc}/training_log.csv")
+        for key in saved_results.columns:
+            if key == "index":
+                continue
+            results_dict[key] = list(saved_results[key])
+        
     # Train 
-    results_dict = defaultdict(list)
-    
     for epoch in range(start_epoch, epochs):
 
         train_loss = []
-        train_disc_loss = []
 
         # set up a custom tqdm
-        batches_per_epoch = 2 #len(train_loader)
+        
+        batches_per_epoch = len(train_loader)
         batch_group_generator = tqdm.tqdm(
             range(batches_per_epoch), total=batches_per_epoch, leave=True
         )
@@ -298,6 +409,7 @@ def trainer(rank, world_size, conf, trial=False):
         for steps in batch_group_generator:
 
             # update generator 
+            
             model.train()
 
             # logs
@@ -307,17 +419,33 @@ def trainer(rank, world_size, conf, trial=False):
             # update vae (generator)
 
             for _ in range(grad_accum_every):
+                
                 batch = next(dl)
                 x = batch["x"].to(device)
                 y1 = batch["y1"].to(device)
-                
+                x_surf = batch["x_surf"].to(device)
+                y1_surf = batch["y1_surf"].to(device)
+
                 with autocast(enabled=amp):
-                    loss = model(
-                        x,
-                        y1,
-                        return_loss=True,
-                        add_gradient_penalty=apply_grad_penalty
+                    y1_pred, y1_pred_surf, loss = model(
+                        x, x_surf, 
+                        y1, y1_surf,
+                        return_recons=True,
+                        return_loss=True
                     )
+                    
+                    del x, x_surf, y1, y1_surf
+                    
+                    y2 = batch["y2"].to(device)
+                    y2_surf = batch["y2_surf"].to(device)
+                    
+                    loss += model(
+                        y1_pred.detach(), y1_pred_surf.detach(), 
+                        y2, y2_surf,
+                        return_recons=False,
+                        return_loss=True
+                    )
+                    
                     scaler.scale(loss / grad_accum_every).backward()
 
                 accum_log(logs, {'loss': loss.item() / grad_accum_every})
@@ -329,8 +457,9 @@ def trainer(rank, world_size, conf, trial=False):
             optimizer.zero_grad()
 
             batch_loss = torch.Tensor([logs["loss"]]).cuda(device)
-            dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
-            results_dict["train_loss"].append(batch_loss[0].item())
+            if distributed:
+                dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
+            train_loss.append(batch_loss[0].item())
             
             # update discriminator
 
@@ -366,13 +495,17 @@ def trainer(rank, world_size, conf, trial=False):
             #     np.mean(results_dict["train_loss"]), 
             #     np.mean(results_dict["train_disc_loss"])
             # )
+            
             to_print = "Epoch {} train_loss: {:.6f}".format(
                 epoch, 
-                np.mean(results_dict["train_loss"])
+                np.mean(train_loss)
             )
             to_print += " lr: {:.12f}".format(optimizer.param_groups[0]["lr"])
             batch_group_generator.set_description(to_print)
             batch_group_generator.update()
+            
+        # Filter out non-float and NaN values from train_loss
+        train_loss = [v for v in train_loss if isinstance(v, float) and np.isfinite(v)]
 
         # Shutdown the progbar
         batch_group_generator.close()
@@ -381,57 +514,88 @@ def trainer(rank, world_size, conf, trial=False):
         torch.cuda.empty_cache()
         gc.collect()
 
-        # Test the model
+        ############
+        #
+        # Evaluation
+        #
+        ############
+        
         model.eval()
-        with torch.no_grad():
-            # set up a custom tqdm
-            valid_batches_per_epoch = 10 #len(test_loader)
-            batch_group_generator = tqdm.tqdm(enumerate(test_loader), total=len(test_loader), leave=True)
 
-            valid_loss = []
-            for k, batch in batch_group_generator:
-                # move to device
+        # logs
+
+        logs = {}
+
+        valid_loss = []
+
+        # set up a custom tqdm
+        
+        valid_batches_per_epoch = len(valid_loader)
+        batch_group_generator = tqdm.tqdm(
+            range(valid_batches_per_epoch), total=valid_batches_per_epoch, leave=True
+        )
+
+        with torch.no_grad():
+            
+            for k in batch_group_generator:
+                
+                batch = next(valid_dl)
                 x = batch["x"].to(device)
                 y1 = batch["y1"].to(device)
-
-                loss = model(
-                    x,
-                    y1,
-                    return_loss=True
-                )
+                x_surf = batch["x_surf"].to(device)
+                y1_surf = batch["y1_surf"].to(device)
+    
+                with autocast(enabled=amp):
+                    y1_pred, y1_pred_surf, loss = model(
+                        x, x_surf, 
+                        y1, y1_surf,
+                        return_recons=True,
+                        return_loss=True
+                    )
+                    
+                    del x, x_surf, y1, y1_surf
+                    
+                    y2 = batch["y2"].to(device)
+                    y2_surf = batch["y2_surf"].to(device)
+                    
+                    loss += model(
+                        y1_pred.detach(), y1_pred_surf.detach(), 
+                        y2, y2_surf,
+                        return_recons=False,
+                        return_loss=True
+                    )
                 
-                # update tqdm
-                batch_loss = torch.Tensor([loss]).cuda(device)
-                dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
-                
+                accum_log(logs, {'loss': loss.item()})
+    
+                batch_loss = torch.Tensor([logs["loss"]]).cuda(device)
+                if distributed:
+                    dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
                 valid_loss.append(batch_loss[0].item())
+
+                # print to tqdm
+                
                 to_print = "Epoch {} valid_loss: {:.6f}".format(
                     epoch, np.mean(valid_loss)
                 )
                 batch_group_generator.set_description(to_print)
                 batch_group_generator.update()
-                
+
                 if k >= valid_batches_per_epoch and k > 0:
                     break
-                    
-            valid_loss.append(valid_loss)
 
-            # Shutdown the progbar
-            batch_group_generator.close()
+        # Shutdown the progbar
+        batch_group_generator.close()
+
+        # Filter out non-float and NaN values from valid_loss
+        valid_loss = [v for v in valid_loss if isinstance(v, float) and np.isfinite(v)]
 
         # clear the cached memory from the gpu
         torch.cuda.empty_cache()
         gc.collect()   
-            
+
         if trial:
             if not np.isfinite(np.mean(valid_loss)):
                 raise optuna.TrialPruned()  
-                
-        # Filter out non-float and NaN values from train_loss
-        train_loss = [v for v in train_loss if isinstance(v, float) and np.isfinite(v)]
-
-        # Filter out non-float and NaN values from valid_loss
-        valid_loss = [v for v in valid_loss if isinstance(v, float) and np.isfinite(v)]
       
         # Put things into a results dictionary -> dataframe
         results_dict["epoch"].append(epoch)
@@ -440,19 +604,49 @@ def trainer(rank, world_size, conf, trial=False):
         results_dict["valid_loss"].append(np.mean(valid_loss))
         results_dict["learning_rate"].append(optimizer.param_groups[0]["lr"])
         
-        print(results_dict)
-        
         df = pd.DataFrame.from_dict(results_dict).reset_index()
+        
+        # Lower the learning rate if we are not improving
+        scheduler.step(np.mean(valid_loss))
 
-        # Save the model if its the best so far.
-        if not trial and (np.mean(valid_loss) == min(results_dict["valid_loss"])):
-            state_dict = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": np.mean(valid_loss),
-            }
-            torch.save(state_dict, f"{save_loc}/best.pt")
+        # Save the best model so far
+        if not trial:
+            torch.distributed.barrier()
+                
+            if rank == 0:
+                
+                # Save the current model
+                
+                state_dict = {
+                    "epoch": epoch,
+                    "model_state_dict": model.module.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
+                    "loss": np.mean(valid_loss),
+                    "learning_rate": optimizer.param_groups[0]["lr"]
+                }
+                torch.save(state_dict, f"{save_loc}/model.pt")
+                
+                # joblib until checkpoint problems are resolved
+                
+                with open(f"{save_loc}/model.pkl", "wb") as f:
+                    joblib.dump({
+                        "epoch": epoch,
+                        "model": model.module,
+                        "optimizer": optimizer,
+                        'scheduler': scheduler,
+                        'scaler': scaler,
+                        "loss": np.mean(valid_loss),
+                        "learning_rate": optimizer.param_groups[0]["lr"]
+                    }, f)
+                
+                # save if this is the best model seen so far
+                
+                if np.mean(valid_loss) == min(results_dict["valid_loss"]):
+                    shutil.copy(f"{save_loc}/model.pt", f"{save_loc}/best.pt")
+                    shutil.copy(f"{save_loc}/model.pkl", f"{save_loc}/best.pkl")
+                    
 
         # Save the dataframe to disk
         if trial:
@@ -462,9 +656,7 @@ def trainer(rank, world_size, conf, trial=False):
             )
         else:
             df.to_csv(f"{save_loc}/training_log.csv", index=False)
-
-        # Lower the learning rate if we are not improving
-        lr_scheduler.step(np.mean(valid_loss))
+            
 
         # Report result to the trial
         if trial:
@@ -585,9 +777,11 @@ if __name__ == "__main__":
 #             "epochs": 10,
 #         }
 #     )    
-        
+
     seed = 1000 if "seed" not in conf else conf["seed"]
     seed_everything(seed)
 
-    trainer(int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]), conf)
-    #trainer(0, 1, conf)
+    if conf["trainer"]["mode"] in ["fsdp", "ddp"]:
+        trainer(int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"]), conf)
+    else:
+        trainer(0, 1, conf)
