@@ -1,4 +1,4 @@
-save_loc: "./results"
+save_loc: "./results/pickle"
 seed: 1000
 
 
@@ -8,18 +8,19 @@ data:
     std_path: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.std.nc'
 
 trainer:
-    mode: fsdp 
-    train_batch_size: 1
-    valid_batch_size: 1
-    learning_rate: 1.0e-05
+    mode: ddp
+    train_batch_size: 2
+    valid_batch_size: 2
+    learning_rate: 1.0e-04
     weight_decay: 0.0
     start_epoch: 0
-    epochs: 100
+    epochs: 1
     amp: False
     grad_accum_every: 1
     apply_grad_penalty: False
     grad_max_norm: 1.0
-    thread_workers: 8
+    thread_workers: 4
+    stopping_patience: 50
 
 model:
     image_height: 640
@@ -29,10 +30,10 @@ model:
     frames: 15
     frame_patch_size: 5
     channels: 4
-    dim: 128
-    layers: 2
-    dim_head: 128
-    mlp_dim: 128
+    dim: 1024
+    layers: 6
+    dim_head: 1024
+    mlp_dim: 1024
     heads: 8
     depth: 4
     vq_codebook_dim: 128
