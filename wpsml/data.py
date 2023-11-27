@@ -85,13 +85,12 @@ class Normalize():
 
 class ToTensor():
     def __init__(self):
+        
         self.allvarsdo = ['U','V','T','Q','SP','t2m','V500','U500','T500','Z500','Q500']
-        self.surfvars = ['t2m','V500','U500','T500','Z500','Q500']
+        self.surfvars = ['SP', 't2m','V500','U500','T500','Z500','Q500']
         
     def __call__(self, sample: Sample) -> Sample:
-        
-        
-        
+    
         return_dict = {}
         
         for key, value in sample.items():
@@ -105,7 +104,7 @@ class ToTensor():
                 for vv in self.allvarsdo: 
                     value_var = value[vv].values
                     if vv in self.surfvars:
-                        surface_vars_temp = np.expand_dims(value_var,axis=1)
+                        surface_vars_temp = value_var
                         surface_vars.append(surface_vars_temp)
                     else:
                         concatenated_vars.append(value_var)
@@ -114,18 +113,18 @@ class ToTensor():
                 value_var = value        
                     
             if key == 'historical_ERA5_images':
-                return_dict['x_surf'] = torch.as_tensor(surface_vars).squeeze(1)
+                return_dict['x_surf'] = torch.as_tensor(surface_vars).squeeze()
                 return_dict['x'] = torch.as_tensor(np.vstack(concatenated_vars))
             elif key == 'target_ERA5_images':
                 y_surf = torch.as_tensor(surface_vars)
+                #print(y_surf)
                 y = torch.as_tensor(np.hstack([np.expand_dims(x, axis=1) for x in concatenated_vars]))
-                return_dict['y1_surf'] = y_surf[0]
-                return_dict['y2_surf'] = y_surf[1]
+                return_dict['y1_surf'] = y_surf[:,0]
+                return_dict['y2_surf'] = y_surf[:,1]
                 return_dict['y1'] = y[0]
                 return_dict['y2'] = y[1]
                 
         return return_dict
-
 
 
 class Segment(NamedTuple):
@@ -230,6 +229,30 @@ def get_zarr_chunk_sequences(
             zarr_chunk_seq_start_i = zarr_chunk_boundaries[i_of_first_zarr_chunk]
             
     return zarr_chunk_sequences
+
+
+Array = Union[np.ndarray, xr.DataArray]
+IMAGE_ATTR_NAMES = ('historical_ERA5_images', 'target_ERA5_images')
+
+class Sample(TypedDict):
+    """Simple class for structuring data for the ML model.
+    
+    Using typing.TypedDict gives us several advantages:
+      1. Single 'source of truth' for the type and documentation of each example.
+      2. A static type checker can check the types are correct.
+
+    Instead of TypedDict, we could use typing.NamedTuple,
+    which would provide runtime checks, but the deal-breaker with Tuples is that they're immutable
+    so we cannot change the values in the transforms.
+    """
+    # IMAGES
+    # Shape: batch_size, seq_length, lat, lon, lev
+    historical_ERA5_images: Array
+    target_ERA5_images: Array
+        
+    # METADATA
+    datetime_index: Array
+
 
 
 def flatten_list(list_of_lists):
@@ -345,4 +368,3 @@ class ERA5Dataset(torch.utils.data.Dataset):
         if self.transform:
             sample = self.transform(sample)
         return sample
-    

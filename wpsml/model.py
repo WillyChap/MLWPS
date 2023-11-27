@@ -80,7 +80,7 @@ class Attention(nn.Module):
         # with torch.backends.cuda.sdp_kernel(
         #     enable_flash=True, 
         #     enable_math=False, 
-        #     enable_mem_efficient=False
+        #     enable_mem_efficient=True
         # ):
         #     out = F.scaled_dot_product_attention(
         #         q, k, v,
@@ -597,7 +597,8 @@ class ViTEncDecSurface(nn.Module):
         frames, 
         frame_patch_size,
         dim,
-        channels = 3,
+        channels = 4,
+        surface_channels = 7,
         depth = 4,
         heads = 8,
         dim_head = 32,
@@ -607,7 +608,7 @@ class ViTEncDecSurface(nn.Module):
         
         num_patches = (image_height // patch_height) * (image_width // patch_width) * (frames // frame_patch_size)
         input_dim = channels * patch_height * patch_width * frame_patch_size
-        input_dim_surface = patch_height * patch_width
+        input_dim_surface = surface_channels * patch_height * patch_width
         
         self.transformer_encoder = Transformer(
             dim = dim,
@@ -633,7 +634,7 @@ class ViTEncDecSurface(nn.Module):
         )
         
         self.encoder_surface = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width, c = 1),
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width, c = surface_channels),
             nn.Linear(input_dim_surface, dim),
             self.transformer_encoder,
              #Rearrange('b (f h w) c -> b c f h w', h = patch_height, w = patch_width)
@@ -660,7 +661,7 @@ class ViTEncDecSurface(nn.Module):
                 nn.Linear(dim * 4, input_dim_surface, bias = False),
             ),
             Rearrange('b (h w) (p1 p2 c) -> b c (p1 h) (w p2)', w = (image_width // patch_width),
-                      c = 1, p1 = patch_height, p2 = patch_width)
+                      c = surface_channels, p1 = patch_height, p2 = patch_width)
         )
 
     def encode(self, x, x_surf):
@@ -685,6 +686,7 @@ class ViTEncoderDecoder(nn.Module):
         frame_patch_size,
         dim,
         channels,
+        surface_channels,
         depth,
         heads,
         dim_head,
@@ -697,7 +699,7 @@ class ViTEncoderDecoder(nn.Module):
         super().__init__()
         
         self.channels = channels
-
+        
         self.enc_dec = ViTEncDecSurface(
             image_height, 
             patch_height, 
@@ -706,11 +708,12 @@ class ViTEncoderDecoder(nn.Module):
             frames, 
             frame_patch_size,
             dim,
-            channels,
-            depth,
-            heads,
-            dim_head,
-            mlp_dim
+            channels=channels,
+            surface_channels=surface_channels,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            mlp_dim=mlp_dim
         )
 
         # reconstruction loss
