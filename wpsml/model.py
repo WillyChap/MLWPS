@@ -10,6 +10,26 @@ from torch.autograd import grad as torch_grad
 import torchvision
 
 
+class CustomLayerNorm(nn.Module):
+    def __init__(self, normalized_shape, eps=1e-5):
+        super(CustomLayerNorm, self).__init__()
+        self.normalized_shape = normalized_shape
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
+        normalized_x = (x - mean) / (std + self.eps)
+
+        # Apply weight and bias without in-place modification
+        weighted_normalized_x = self.weight * normalized_x
+        output = weighted_normalized_x + self.bias
+
+        return output
+
+
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, dropout = 0.):
         super().__init__()
@@ -23,6 +43,7 @@ class FeedForward(nn.Module):
         )
     def forward(self, x):
         return self.net(x)
+
 
 class Attention(nn.Module):
     def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
@@ -49,27 +70,107 @@ class Attention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim = -1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
 
-        # dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
-        # attn = self.attend(dots)
-        # attn = self.dropout(attn)
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
 
-        # out = torch.matmul(attn, v)
+        out = torch.matmul(attn, v)
 
-        with torch.backends.cuda.sdp_kernel(
-            enable_flash=True, 
-            enable_math=False, 
-            enable_mem_efficient=False
-        ):
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask = None,
-                dropout_p = 0.0
-            )
+        # with torch.backends.cuda.sdp_kernel(
+        #     enable_flash=True, 
+        #     enable_math=False, 
+        #     enable_mem_efficient=False
+        # ):
+        #     out = F.scaled_dot_product_attention(
+        #         q, k, v,
+        #         attn_mask = None,
+        #         dropout_p = 0.0
+        #     )
 
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
 
+    
+class ContinuousPositionBias(nn.Module):
+    """ from https://arxiv.org/abs/2111.09883 """
+
+    def __init__(self, *, dim, heads, layers = 2):
+        super().__init__()
+        self.net = MList([])
+        self.net.append(nn.Sequential(nn.Linear(2, dim), leaky_relu()))
+
+        for _ in range(layers - 1):
+            self.net.append(nn.Sequential(nn.Linear(dim, dim), leaky_relu()))
+
+        self.net.append(nn.Linear(dim, heads))
+        self.register_buffer('rel_pos', None, persistent = False)
+
+    def forward(self, x):
+        n, device = x.shape[-1], x.device
+        fmap_size = int(sqrt(n))
+
+        if not exists(self.rel_pos):
+            pos = torch.arange(fmap_size, device = device)
+            grid = torch.stack(torch.meshgrid(pos, pos, indexing = 'ij'))
+            grid = rearrange(grid, 'c i j -> (i j) c')
+            rel_pos = rearrange(grid, 'i c -> i 1 c') - rearrange(grid, 'j c -> 1 j c')
+            rel_pos = torch.sign(rel_pos) * torch.log(rel_pos.abs() + 1)
+            self.register_buffer('rel_pos', rel_pos, persistent = False)
+
+        rel_pos = self.rel_pos.float()
+
+        for layer in self.net:
+            rel_pos = layer(rel_pos)
+
+        bias = rearrange(rel_pos, 'i j h -> h i j')
+        return x + bias
+    
+    
+class ViTAttention(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        dim_head = 64,
+        heads = 8,
+        dropout = 0.
+    ):
+        super().__init__()
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        inner_dim = heads * dim_head
+
+        self.dropout = nn.Dropout(dropout)
+        self.pre_norm = LayerNormChan(dim)
+
+        self.cpb = ContinuousPositionBias(dim = dim // 4, heads = heads)
+        self.to_qkv = nn.Conv2d(dim, inner_dim * 3, 1, bias = False)
+        self.to_out = nn.Conv2d(inner_dim, dim, 1, bias = False)
+
+    def forward(self, x):
+        h = self.heads
+        height, width, residual = *x.shape[-2:], x.clone()
+
+        x = self.pre_norm(x)
+
+        q, k, v = self.to_qkv(x).chunk(3, dim = 1)
+
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h = h), (q, k, v))
+
+        sim = einsum('b h c i, b h c j -> b h i j', q, k) * self.scale
+
+        sim = self.cpb(sim)
+
+        attn = stable_softmax(sim, dim = -1)
+        attn = self.dropout(attn)
+
+        out = einsum('b h i j, b h c j -> b h c i', attn, v)
+        out = rearrange(out, 'b h c (x y) -> b (h c) x y', x = height, y = width)
+        out = self.to_out(out)
+
+        return out + residual
+    
     
 class Transformer(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
@@ -279,6 +380,10 @@ class VQGanVAE(nn.Module):
         self.vgg = torchvision.models.vgg16(pretrained = True)
         self.vgg.features[0] = torch.nn.Conv2d(channels, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
         self.vgg.classifier = nn.Sequential(*self.vgg.classifier[:-2])
+        
+        # Freeze the weights of the pre-trained layers
+        for param in self.vgg.parameters():
+            param.requires_grad = False
 
         # gan related losses
         layer_mults = list(map(lambda t: 2 ** t, range(discr_layers)))
@@ -415,39 +520,249 @@ class VQGanVAE(nn.Module):
 
             return recon_loss
 
+#         # perceptual loss
+#         img_vgg_input = img
+#         fmap_vgg_input = fmap
+
+#         # in the dall-e example, there are no frames (pressure levels). here we reshape instead of loop over levels
+#         # first get the vae loss
+#         loss = recon_loss + commit_loss
+
+#         # Reshape inputs
+#         num_channels = img_vgg_input.shape[1]
+#         num_frames = img_vgg_input.shape[2]
+#         height = img_vgg_input.shape[3]
+#         width = img_vgg_input.shape[4]
+
+#         img_vgg_input_reshaped = img_vgg_input.permute(0, 2, 1, 3, 4).contiguous().view(-1, num_channels, height, width)
+#         fmap_vgg_input_reshaped = fmap_vgg_input.permute(0, 2, 1, 3, 4).contiguous().view(-1, num_channels, height, width)
+        
+#         # Compute VGG features for the original and reconstructed frames
+#         img_vgg_feats = self.vgg(img_vgg_input_reshaped)
+#         recon_vgg_feats = self.vgg(fmap_vgg_input_reshaped)
+        
+#         # Compute the perceptual loss (MSE loss between VGG features)
+#         perceptual_loss = F.mse_loss(img_vgg_feats, recon_vgg_feats)
+        
+#         # Combine losses
+#         loss += perceptual_loss
+
         # perceptual loss
         img_vgg_input = img
         fmap_vgg_input = fmap
-
-        # in the dall-e example, there are no frames (pressure levels). here we reshape instead of loop over levels
-        # first get the vae loss
+        
+        # in the dall-e example, there are no frames (pressure levels). here we loop over them and sum the losses
         loss = recon_loss + commit_loss
+        for i in range(img_vgg_input.shape[2]):
+            # Get the i-th frame from the original and reconstructed videos
+            img_frame = img_vgg_input[:, :, i, :, :]
+            fmap_frame = fmap_vgg_input[:, :, i, :, :]
 
-        # Reshape inputs
-        num_channels = img_vgg_input.shape[1]
-        num_frames = img_vgg_input.shape[2]
-        height = img_vgg_input.shape[3]
-        width = img_vgg_input.shape[4]
+            # Compute VGG features for the original and reconstructed frames
+            img_vgg_feats = self.vgg(img_frame)
+            recon_vgg_feats = self.vgg(fmap_frame)
 
-        img_vgg_input_reshaped = img_vgg_input.permute(0, 2, 1, 3, 4).contiguous().view(-1, num_channels, height, width)
-        fmap_vgg_input_reshaped = fmap_vgg_input.permute(0, 2, 1, 3, 4).contiguous().view(-1, num_channels, height, width)
-        
-        # Compute VGG features for the original and reconstructed frames
-        img_vgg_feats = self.vgg(img_vgg_input_reshaped)
-        recon_vgg_feats = self.vgg(fmap_vgg_input_reshaped)
-        
-        # Compute the perceptual loss (MSE loss between VGG features)
-        perceptual_loss = F.mse_loss(img_vgg_feats, recon_vgg_feats)
-        
-        # Combine losses
-        loss += perceptual_loss
+            # Compute the perceptual loss (MSE loss between VGG features)
+            perceptual_loss = F.mse_loss(img_vgg_feats, recon_vgg_feats)
 
-        # # perceptual loss
+            #print(i, perceptual_loss)
+            # generator loss
+            #gen_loss = self.gen_loss(self.discr(fmap_frame))
+
+            # calculate adaptive weight
+            #last_dec_layer = self.enc_dec.last_dec_layer
+            #norm_grad_wrt_gen_loss = 1.0 #grad_layer_wrt_loss(gen_loss, last_dec_layer).norm(p = 2)
+            #norm_grad_wrt_perceptual_loss = 1.0 #grad_layer_wrt_loss(perceptual_loss, last_dec_layer).norm(p = 2)
+
+            #print(norm_grad_wrt_perceptual_loss, norm_grad_wrt_gen_loss)
+            #adaptive_weight = safe_div(norm_grad_wrt_perceptual_loss, norm_grad_wrt_gen_loss)
+            #adaptive_weight.clamp_(max = 1e4)
+
+            # combine losses
+            loss += perceptual_loss #(perceptual_loss + adaptive_weight * gen_loss)
+
+        if return_recons:
+            return loss, fmap
+
+        return loss
+
+
+class ViTEncDecSurface(nn.Module):
+    def __init__(
+        self,
+        image_height, 
+        patch_height,
+        image_width,
+        patch_width,
+        frames, 
+        frame_patch_size,
+        dim,
+        channels = 3,
+        depth = 4,
+        heads = 8,
+        dim_head = 32,
+        mlp_dim = 32
+    ):
+        super().__init__()
+        
+        num_patches = (image_height // patch_height) * (image_width // patch_width) * (frames // frame_patch_size)
+        input_dim = channels * patch_height * patch_width * frame_patch_size
+        input_dim_surface = patch_height * patch_width
+        
+        self.transformer_encoder = Transformer(
+            dim = dim,
+            depth = depth,
+            dim_head = dim_head,
+            heads = heads,
+            mlp_dim = mlp_dim
+        )
+        
+        self.transformer_decoder = Transformer(
+            dim = dim,
+            depth = depth,
+            dim_head = dim_head,
+            heads = heads,
+            mlp_dim = mlp_dim
+        )
+        
+        self.encoder = nn.Sequential(
+            Rearrange('b c (f pf) (h p1) (w p2) -> b (f h w) (p1 p2 pf c)', p1 = patch_height, p2 = patch_width, pf = frame_patch_size),
+            nn.Linear(input_dim, dim),
+            self.transformer_encoder,
+             #Rearrange('b (f h w) c -> b c f h w', h = patch_height, w = patch_width)
+        )
+        
+        self.encoder_surface = nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width, c = 1),
+            nn.Linear(input_dim_surface, dim),
+            self.transformer_encoder,
+             #Rearrange('b (f h w) c -> b c f h w', h = patch_height, w = patch_width)
+        )
+        
+        self.decoder = nn.Sequential(
+            #Rearrange('b c f h w -> b (f h w) c'),
+            self.transformer_decoder,
+            nn.Sequential(
+                nn.Linear(dim, dim * 4, bias = False),
+                nn.Tanh(),
+                nn.Linear(dim * 4, input_dim, bias = False),
+            ),
+            Rearrange('b (f h w) (p1 p2 pf c) -> b c (pf f) (p1 h) (w p2)', 
+                      h = (image_height // patch_height), f = (frames // frame_patch_size), p1 = patch_height, p2 = patch_width, pf = frame_patch_size)
+        )
+        
+        self.decoder_surface = nn.Sequential(
+            #Rearrange('b c f h w -> b (f h w) c'),
+            self.transformer_decoder,
+            nn.Sequential(
+                nn.Linear(dim, dim * 4, bias = False),
+                nn.Tanh(),
+                nn.Linear(dim * 4, input_dim_surface, bias = False),
+            ),
+            Rearrange('b (h w) (p1 p2 c) -> b c (p1 h) (w p2)', w = (image_width // patch_width),
+                      c = 1, p1 = patch_height, p2 = patch_width)
+        )
+
+    def encode(self, x, x_surf):
+        encoded = self.encoder(x)
+        encoded_surf = self.encoder_surface(x_surf)
+        return encoded, encoded_surf
+
+    def decode(self, x, x_surf):
+        decoded = self.decoder(x)
+        decoded_surf = self.decoder_surface(x_surf)
+        return decoded, decoded_surf
+    
+
+class ViTEncoderDecoder(nn.Module):
+    def __init__(
+        self,
+        image_height, 
+        patch_height, 
+        image_width,
+        patch_width,
+        frames, 
+        frame_patch_size,
+        dim,
+        channels,
+        depth,
+        heads,
+        dim_head,
+        mlp_dim,
+        l2_recon_loss = False,
+        use_hinge_loss = True,
+        vgg = None,
+        **kwargs
+    ):
+        super().__init__()
+        
+        self.channels = channels
+
+        self.enc_dec = ViTEncDecSurface(
+            image_height, 
+            patch_height, 
+            image_width,
+            patch_width,
+            frames, 
+            frame_patch_size,
+            dim,
+            channels,
+            depth,
+            heads,
+            dim_head,
+            mlp_dim
+        )
+
+        # reconstruction loss
+        self.recon_loss_fn = F.mse_loss if l2_recon_loss else F.l1_loss
+
+    def state_dict(self, *args, **kwargs):
+        return super().state_dict(*args, **kwargs)
+
+    def load_state_dict(self, *args, **kwargs):
+        return super().load_state_dict(*args, **kwargs)
+
+    def encode(self, fmap, fmap_surface):
+        fmap, fmap_surface = self.enc_dec.encode(fmap, fmap_surface)
+        return fmap, fmap_surface
+
+    def decode(self, fmap, fmap_surface):
+
+        fmap, fmap_surface = self.enc_dec.decode(fmap, fmap_surface)
+
+        return fmap, fmap_surface
+    
+    def forward(
+        self,
+        img,
+        img_surface,
+        y_img,
+        y_img_surface,
+        return_loss = False,
+        return_recons = False
+    ):
+        batch, channels, frames, height, width, device = *img.shape, img.device
+        
+        fmap, fmap_surface = self.encode(img, img_surface)
+        fmap, fmap_surface = self.decode(fmap, fmap_surface)
+
+        if not return_loss:
+            return fmap, fmap_surface
+
+        # reconstruction loss
+        recon_loss = self.recon_loss_fn(y_img, fmap)
+        recon_loss_surface = self.recon_loss_fn(y_img_surface, fmap_surface)
+        
+        loss = recon_loss + recon_loss_surface
+
+        if return_recons:
+            return fmap, fmap_surface, loss
+        
+        # perceptual
         # img_vgg_input = img
         # fmap_vgg_input = fmap
         
         # # in the dall-e example, there are no frames (pressure levels). here we loop over them and sum the losses
-        # loss = recon_loss + commit_loss
         # for i in range(img_vgg_input.shape[2]):
         #     # Get the i-th frame from the original and reconstructed videos
         #     img_frame = img_vgg_input[:, :, i, :, :]
@@ -476,12 +791,9 @@ class VQGanVAE(nn.Module):
         #     # combine losses
         #     loss += perceptual_loss #(perceptual_loss + adaptive_weight * gen_loss)
 
-        if return_recons:
-            return loss, fmap
-
         return loss
-
-
+    
+    
 
 if __name__ == "__main__":
     image_height = 640  # 640

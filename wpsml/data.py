@@ -6,9 +6,12 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import xarray as xr
+import dask.array as da
 
 # PyTorch
 import torch
+import zarr
+from zarr.storage import KVStore
 
 
 def get_forward_data(filename) -> xr.DataArray:
@@ -69,12 +72,15 @@ class Normalize():
         self.std_ds = xr.open_dataset(std_file)
 
     def __call__(self, sample:Sample)->Sample:
+        normalized_sample = {}
         for key, value in sample.items():
             if isinstance(value, xr.Dataset):
-                key_change = key
-                value_change = (value - self.mean_ds)/self.std_ds
-                sample[key]=value_change
-        return sample
+                #key_change = key
+                #value_change = (value - self.mean_ds)/self.std_ds
+                #sample[key]=value_change
+                normalized_sample[key] = (value - self.mean_ds) / self.std_ds
+        return normalized_sample
+
 
 class ToTensor():
     def __call__(self, sample: Sample) -> Sample:
@@ -101,17 +107,19 @@ class ToTensor():
                 value_var = value        
                     
             if key == 'historical_ERA5_images':
-                return_dict['x_surf'] = torch.from_numpy(surface_vars).squeeze(1)
-                return_dict['x'] = torch.from_numpy(np.vstack(concatenated_vars))
+                return_dict['x_surf'] = torch.as_tensor(surface_vars).squeeze(1)
+                return_dict['x'] = torch.as_tensor(np.vstack(concatenated_vars))
             elif key == 'target_ERA5_images':
-                y_surf = torch.from_numpy(surface_vars)
-                y = torch.from_numpy(np.hstack([np.expand_dims(x, axis=1) for x in concatenated_vars]))
+                y_surf = torch.as_tensor(surface_vars)
+                y = torch.as_tensor(np.hstack([np.expand_dims(x, axis=1) for x in concatenated_vars]))
                 return_dict['y1_surf'] = y_surf[0]
                 return_dict['y2_surf'] = y_surf[1]
                 return_dict['y1'] = y[0]
                 return_dict['y2'] = y[1]
                 
         return return_dict
+
+
 
 class Segment(NamedTuple):
     """Represents the start and end indicies of a segment of contiguous samples."""
@@ -238,7 +246,7 @@ class ERA5Dataset(torch.utils.data.Dataset):
         self.total_seq_len = self.history_len + self.forecast_len
 
     def __len__(self):
-        return len(self.data_array['time'])-2
+        return len(self.data_array['time']) - self.total_seq_len + 1
 
     def __getitem__(self, index):
         
