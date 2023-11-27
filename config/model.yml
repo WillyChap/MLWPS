@@ -3,9 +3,9 @@ seed: 1000
 
 
 data:
-    save_loc: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.zarr'
-    mean_path: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.mean.nc'
-    std_path: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.std.nc'
+    save_loc: '/glade/derecho/scratch/wchapman/STAGING/TOTAL_*'
+    mean_path: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.SLO.mean.nc'
+    std_path: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.SLO.std.nc'
 
 trainer:
     mode: ddp

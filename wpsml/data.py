@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import dask.array as da
+import glob
 
 # PyTorch
 import torch
@@ -83,7 +84,13 @@ class Normalize():
 
 
 class ToTensor():
+    def __init__(self):
+        self.allvarsdo = ['U','V','T','Q','SP','t2m','V500','U500','T500','Z500','Q500']
+        self.surfvars = ['t2m','V500','U500','T500','Z500','Q500']
+        
     def __call__(self, sample: Sample) -> Sample:
+        
+        
         
         return_dict = {}
         
@@ -93,13 +100,13 @@ class ToTensor():
                 value_var = value.values
                 
             elif isinstance(value, xr.Dataset):
-                surface_vars = 0
+                surface_vars = []
                 concatenated_vars = []
-                varsdo = ['U','V','T','Q','SP']
-                for vv in varsdo: 
+                for vv in self.allvarsdo: 
                     value_var = value[vv].values
-                    if vv == 'SP':
-                        surface_vars = np.expand_dims(value_var,axis=1)
+                    if vv in self.surfvars:
+                        surface_vars_temp = np.expand_dims(value_var,axis=1)
+                        surface_vars.append(surface_vars_temp)
                     else:
                         concatenated_vars.append(value_var)
                     
@@ -225,32 +232,109 @@ def get_zarr_chunk_sequences(
     return zarr_chunk_sequences
 
 
+def flatten_list(list_of_lists):
+    """
+    Flatten a list of lists.
+
+    Parameters:
+    - list_of_lists (list): A list containing sublists.
+
+    Returns:
+    - flattened_list (list): A flattened list containing all elements from sublists.
+    """
+    return [item for sublist in list_of_lists for item in sublist]
+
+def generate_integer_list_around(number, spacing=10):
+    """
+    Generate a list of integers on either side of a given number with a specified spacing.
+
+    Parameters:
+    - number (int): The central number around which the list is generated.
+    - spacing (int): The spacing between consecutive integers in the list. Default is 10.
+
+    Returns:
+    - integer_list (list): List of integers on either side of the given number.
+    """
+    lower_limit = number - spacing
+    upper_limit = number + spacing + 1  # Adding 1 to include the upper limit
+    integer_list = list(range(lower_limit, upper_limit))
+
+    return integer_list
+
+def find_key_for_number(input_number, data_dict):
+    """
+    Find the key in the dictionary based on the given number.
+
+    Parameters:
+    - input_number (int): The number to search for in the dictionary.
+    - data_dict (dict): The dictionary with keys and corresponding value lists.
+
+    Returns:
+    - key_found (str): The key in the dictionary where the input number falls within the specified range.
+    """
+    for key, value_list in data_dict.items():
+        if value_list[1] <= input_number <= value_list[2]:
+            return key
+
+    # Return None if the number is not within any range
+    return None
+
 class ERA5Dataset(torch.utils.data.Dataset):
     
     def __init__(
         self,
-        filename: str = '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.zarr',
+        filenames: list = ['/glade/derecho/scratch/wchapman/STAGING/TOTAL_2012-01-01_2012-12-31_staged.zarr','/glade/derecho/scratch/wchapman/STAGING/TOTAL_2013-01-01_2013-12-31_staged.zarr'],
         history_len: int = 1,
         forecast_len: int = 2,
         transform: Optional[Callable] = None,
+        SEED=42,
     ):
         self.history_len = history_len
         self.forecast_len = forecast_len
         self.transform = transform
         self.total_seq_len = self.history_len + self.forecast_len
-        self.data_array = get_forward_data(filename=filename)
-        self.rng = np.random.default_rng(seed=torch.initial_seed())
-    
+        all_fils = []
+        filenames = sorted(filenames)
+        for fn in filenames:
+            all_fils.append(get_forward_data(filename=fn))
+        self.all_fils = all_fils
+        self.data_array = all_fils[0]
+        self.rng = np.random.default_rng(seed=SEED)
+        
+        #set data places: 
+        indo = 0
+        self.meta_data_dict = {}
+        for ee,bb in enumerate(self.all_fils):
+            self.meta_data_dict[str(ee)]=[len(bb['time']),indo,indo+len(bb['time'])]
+            indo += len(bb['time'])+1
+            
+        #set out of bounds indexes... 
+        OOB = []
+        for kk in self.meta_data_dict.keys():
+            OOB.append(generate_integer_list_around(self.meta_data_dict[kk][2]))
+        self.OOB = flatten_list(OOB)
+                
     def __post_init__(self):
         #: Total sequence length of each sample.
         self.total_seq_len = self.history_len + self.forecast_len
 
     def __len__(self):
-        return len(self.data_array['time']) - self.total_seq_len + 1
+        tlen = 0
+        for bb in self.all_fils:
+            tlen+=len(bb['time']) - self.total_seq_len + 1
+        return tlen
 
     def __getitem__(self, index):
         
-        datasel = self.data_array.isel(time=slice(index, index+self.forecast_len+1)).load()
+        #find the result key:
+        result_key = find_key_for_number(index, self.meta_data_dict)
+        #get the data selection:
+        true_ind = index-self.meta_data_dict[result_key][1]
+        
+        if true_ind > (len(self.all_fils[int(result_key)]['time'])-(self.forecast_len+1)):
+            true_ind = len(self.all_fils[int(result_key)]['time'])-(self.forecast_len+1)
+        
+        datasel = self.all_fils[int(result_key)].isel(time=slice(true_ind, true_ind+self.forecast_len+1)).load()
         
         sample = Sample(
             historical_ERA5_images=datasel.isel(time=slice(0, self.history_len)),
@@ -261,3 +345,4 @@ class ERA5Dataset(torch.utils.data.Dataset):
         if self.transform:
             sample = self.transform(sample)
         return sample
+    

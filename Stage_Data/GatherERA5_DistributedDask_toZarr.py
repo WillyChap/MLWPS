@@ -113,6 +113,17 @@ def fp_dates_wanted(Dateswanted):
     fp_q = []
     fp_ps = []
     
+    #other grid: 
+    fp_z = []
+    fp_ub = []
+    fp_vb = []
+    fp_tb = []
+    fp_qb = []
+    
+    #surface / single level:
+    fp_t2m = []
+    
+    
     lastday = str(Dateswanted[-1])[:10]
     
     for yrm_fp in np.unique(list_yrm):
@@ -124,7 +135,7 @@ def fp_dates_wanted(Dateswanted):
             fp_t.append(sorted(glob.glob('/glade/campaign/collections/rda/data/ds633.6/e5.oper.an.ml/'+yrm_fp+'/'+'*_t*'+yrm_fp+f'{dayday:02}'+'*.nc')))
             fp_q.append(sorted(glob.glob('/glade/campaign/collections/rda/data/ds633.6/e5.oper.an.ml/'+yrm_fp+'/'+'*_q*'+yrm_fp+f'{dayday:02}'+'*.nc')))
             fp_ps.append(sorted(glob.glob('/glade/campaign/collections/rda/data/ds633.6/e5.oper.an.ml/'+yrm_fp+'/'+'*_sp*'+yrm_fp+f'{dayday:02}'+'*.nc')))
-            
+                    
             if yrm_fp[:4]+'-'+yrm_fp[4:]+'-'+f'{dayday:02}' == lastday:
                 break
 

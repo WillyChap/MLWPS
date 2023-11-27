@@ -1,4 +1,4 @@
-xsx#!/bin/bash -l
+#!/bin/bash -l
 # PBS -N ERA5_stage
 # PBS -A NAML0001
 # PBS -l walltime=12:00:00
@@ -16,6 +16,12 @@ xsx#!/bin/bash -l
 qsub -I -q casper -A P54048000 -l walltime=12:00:00 -l select=3:ncpus=3:mem=30GB
 conda activate MLWPS
 python ./GatherERA5_DistributedDask.py > Gather.run.out
+
+python GatherERA5_DistributedDask_toZarr_dev.py --start_date 2010-01-01 --end_date 2011-01-01
+python GatherERA5_DistributedDask_toZarr_dev.py --start_date 2013-01-01 --end_date 2014-01-01
+python GatherERA5_DistributedDask_toZarr_dev.py --start_date 2014-01-01 --end_date 2015-01-01
+
+
 
 
 python GatherERA5_DistributedDask_toZarr.py --start_date 2012-01-01 --end_date 2013-01-01
