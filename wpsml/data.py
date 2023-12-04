@@ -321,7 +321,6 @@ class ERA5Dataset(torch.utils.data.Dataset):
         for fn in filenames:
             all_fils.append(get_forward_data(filename=fn))
         self.all_fils = all_fils
-        self.data_array = all_fils[0]
         self.rng = np.random.default_rng(seed=SEED)
         
         #set data places: 

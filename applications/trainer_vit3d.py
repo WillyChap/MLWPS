@@ -32,6 +32,7 @@ import yaml
 
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed.checkpoint as DCP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
@@ -41,13 +42,18 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
 from torch.distributed.fsdp.wrap import (
     size_based_auto_wrap_policy,
     enable_wrap,
-    wrap,
+    wrap
 )
+from torch.distributed.fsdp import StateDictType, FullStateDictConfig, ShardedStateDictConfig, OptimStateDictConfig, ShardedOptimStateDictConfig
+
 from torchvision import transforms
 from wpsml.model import ViTEncoderDecoder
 from wpsml.data import ERA5Dataset, ToTensor, Normalize 
 import joblib
-import flash
+
+from torch.distributed.fsdp import StateDictType
+from torch.distributed.fsdp import FullStateDictConfig
+from torch.distributed.fsdp import FullOptimStateDictConfig
 
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -164,6 +170,8 @@ def trainer(rank, world_size, conf, trial=False):
     save_loc = conf['save_loc']
     train_batch_size = conf['trainer']['train_batch_size']
     valid_batch_size = conf['trainer']['valid_batch_size']
+    batches_per_epoch = conf['trainer']['batches_per_epoch']
+    valid_batches_per_epoch = conf['trainer']['valid_batches_per_epoch']
     learning_rate = conf['trainer']['learning_rate']
     weight_decay = conf['trainer']['weight_decay']
     start_epoch = conf['trainer']['start_epoch']
@@ -189,13 +197,29 @@ def trainer(rank, world_size, conf, trial=False):
     mlp_dim = conf['model']['mlp_dim']
     heads = conf['model']['heads']
     depth = conf['model']['depth']
+
+    rk4_integration = conf['model']['rk4_integration']
+    num_register_tokens = conf['model']['num_register_tokens'] if 'num_register_tokens' in conf['model'] else 0
+    use_registers = conf['model']['use_registers'] if 'use_registers' in conf['model'] else False
+    token_dropout = conf['model']['token_dropout'] if 'token_dropout' in conf['model'] else 0.0
     
-    vq_codebook_dim = conf['model']['vq_codebook_dim']
-    vq_codebook_size = conf['model']['vq_codebook_size']
-    vq_entropy_loss_weight = conf['model']['vq_entropy_loss_weight']
-    vq_diversity_gamma = conf['model']['vq_diversity_gamma']
-    discr_layers = conf['model']['discr_layers']
+    use_codebook = conf['model']['use_codebook'] if 'use_codebook' in conf['model'] else False
+    vq_codebook_size = conf['model']['vq_codebook_size'] if 'vq_codebook_size' in conf['model'] else 128
+    vq_decay = conf['model']['vq_decay'] if 'vq_decay' in conf['model'] else 0.1
+    vq_commitment_weight = conf['model']['vq_commitment_weight'] if 'vq_commitment_weight' in conf['model'] else 1.0
     
+    use_vgg = conf['model']['use_vgg'] if 'use_vgg' in conf['model'] else False
+    
+    use_visual_ssl = conf['model']['use_visual_ssl'] if 'use_visual_ssl' in conf['model'] else False
+    visual_ssl_weight = conf['model']['visual_ssl_weight'] if 'visual_ssl_weight' in conf['model'] else 0.05
+    
+    use_spectral_loss = conf['model']['use_spectral_loss']
+    spectral_wavenum_init = conf['model']['spectral_wavenum_init'] if 'spectral_wavenum_init' in conf['model'] else 20
+    spectral_lambda_reg = conf['model']['spectral_lambda_reg'] if 'spectral_lambda_reg' in conf['model'] else 1.0
+    
+    l2_recon_loss = conf['model']['l2_recon_loss'] if 'l2_recon_loss' in conf['model'] else False
+    use_hinge_loss = conf['model']['use_hinge_loss'] if 'use_hinge_loss' in conf['model'] else True
+
     # Data vars
     channels = len(conf["data"]["variables"])
     surface_channels = len(conf["data"]["surface_variables"])
@@ -203,8 +227,12 @@ def trainer(rank, world_size, conf, trial=False):
     # datasets (zarr reader) 
     all_ERA_files = sorted(glob.glob(conf["data"]["save_loc"]))
     
+    # Specify the years to be excluded -- remove later
+    years_to_exclude = ['1979', '1980', '1981', '1985', '1994']
+    all_ERA_files = [file for file in all_ERA_files if not any(year in file for year in years_to_exclude)]
+    
     train_dataset = ERA5Dataset(
-        filenames=all_ERA_files[1:len(all_ERA_files)-1],
+        filenames=all_ERA_files[2:len(all_ERA_files)-1],
         transform=transforms.Compose([
             Normalize(conf["data"]["mean_path"],conf["data"]["std_path"]),
             ToTensor(),
@@ -212,7 +240,7 @@ def trainer(rank, world_size, conf, trial=False):
     )
     
     valid_dataset = ERA5Dataset(
-        filenames=all_ERA_files[0:1],
+        filenames=all_ERA_files[1:2],
         transform=transforms.Compose([
             Normalize(conf["data"]["mean_path"],conf["data"]["std_path"]),
             ToTensor(),
@@ -250,138 +278,156 @@ def trainer(rank, world_size, conf, trial=False):
                               shuffle=False, 
                               sampler=sampler_val, 
                               pin_memory=True, 
-                              num_workers=thread_workers)
+                              num_workers=thread_workers,
+                              drop_last=True)
     
     # cycle for later so we can accum grad dataloader
     
     dl = cycle(train_loader)
     valid_dl = cycle(valid_loader)
-    
-    if start_epoch > 0:
-        with open(f"{save_loc}/best.pkl", "rb") as f:
-            loaded_objects = joblib.load(f)
 
-        model = loaded_objects["model"].to(device)
-        if conf["trainer"]["mode"] == "fsdp":
-            auto_wrap_policy = functools.partial(
-                size_based_auto_wrap_policy, min_num_params=1_000_000
-            )
-            model = FSDP(
-                model,
-                use_orig_params=True,
-                auto_wrap_policy=auto_wrap_policy,
-                mixed_precision=torch.distributed.fsdp.MixedPrecision(
-                    param_dtype=torch.float16, 
-                    reduce_dtype=torch.float16, 
-                    buffer_dtype=torch.float16, 
-                    cast_forward_inputs=True
-                ),
-                #sharding_strategy=ShardingStrategy.FULL_SHARD # Zero3. Zero2 = ShardingStrategy.SHARD_GRAD_OP
-            )
-        elif conf["trainer"]["mode"] == "ddp":
-            model = DDP(model, device_ids=[device], output_device=None)
-        else:
-            model = model
+    # model 
+    vae = ViTEncoderDecoder(
+        image_height=image_height,
+        patch_height=patch_height,
+        image_width=image_width,
+        patch_width=patch_width,
+        frames=frames,
+        frame_patch_size=frame_patch_size,
+        dim=dim,
+        channels=channels,
+        surface_channels=surface_channels,
+        depth=depth,
+        heads=heads,
+        dim_head=dim_head,
+        mlp_dim=mlp_dim,
+        rk4_integration=rk4_integration,
+        num_register_tokens=num_register_tokens,
+        use_registers=use_registers,
+        token_dropout=token_dropout,
+        use_codebook=use_codebook,
+        vq_codebook_size=vq_codebook_size,
+        vq_decay=vq_decay,
+        vq_commitment_weight=vq_commitment_weight,
+        use_vgg=use_vgg,
+        use_visual_ssl=use_visual_ssl,
+        visual_ssl_weight=visual_ssl_weight,
+        use_spectral_loss=use_spectral_loss,
+        spectral_wavenum_init=spectral_wavenum_init,
+        spectral_lambda_reg=spectral_lambda_reg,
+        l2_recon_loss=l2_recon_loss,
+        use_hinge_loss=use_hinge_loss
+    )
+
+    num_params = sum(p.numel() for p in vae.parameters())
+    if rank == 0:
+        logging.info(f"Number of parameters in the model: {num_params}")
         
-        optimizer = loaded_objects["optimizer"]
-        scheduler = loaded_objects["scheduler"]
-        scaler = loaded_objects["scaler"]
-        start_epoch = loaded_objects["epoch"] + 1
-        learning_rate = loaded_objects["learning_rate"]
-        
-        # make sure the loaded optimizer is on the same device as the reloaded model
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
-        
-    else:
-    
-        # model 
-        vae = ViTEncoderDecoder(
-            image_height, 
-            patch_height, 
-            image_width,
-            patch_width,
-            frames, 
-            frame_patch_size,
-            dim,
-            channels,
-            surface_channels,
-            depth,
-            heads,
-            dim_head,
-            mlp_dim
-        ) 
+    #summary(vae, input_size=(channels, height, width))
 
-        num_params = sum(p.numel() for p in vae.parameters())
-        if rank == 0:
-            logging.info(f"Number of parameters in the model: {num_params}")
-            
-        #summary(vae, input_size=(channels, height, width))
+    # have to send the module to the correct device first
+    vae.to(device)
+    #vae = torch.compile(vae)
 
-        # have to send the module to the correct device first
-        vae.to(device)
-        #vae = torch.compile(vae)
-
-        if start_epoch > 0:
-            # Load weights
-            if rank == 0:
-                logging.info(f"Restarting training at epoch {start_epoch}")
-                logging.info(f"Loading model weights from {save_loc}")
-            checkpoint = torch.load(
-                os.path.join(save_loc, "best.pt"),
-                map_location=lambda storage, loc: storage,
-            )
-            vae.load_state_dict(checkpoint["model_state_dict"])    
-
-        # will not check that the device is correct here
-        if conf["trainer"]["mode"] == "fsdp":
-            auto_wrap_policy = functools.partial(
-                size_based_auto_wrap_policy, min_num_params=1_000_000
-            )
-            # maybe try transformer_auto_wrap_policy instead ... 
-
-            model = FSDP(
-                vae,
-                use_orig_params=True,
-                auto_wrap_policy=auto_wrap_policy,
-                mixed_precision=torch.distributed.fsdp.MixedPrecision(
-                    param_dtype=torch.float16, 
-                    reduce_dtype=torch.float16, 
-                    buffer_dtype=torch.float16, 
-                    cast_forward_inputs=True
-                ),
-                #sharding_strategy=ShardingStrategy.FULL_SHARD # Zero3. Zero2 = ShardingStrategy.SHARD_GRAD_OP
-            )
-        elif conf["trainer"]["mode"] == "ddp":
-            model = DDP(vae, device_ids=[device], output_device=None)
-        else:
-            model = vae
-
-        # Load an optimizer, gradient scaler, and learning rate scheduler, the optimizer must come after wrapping model using FSDP
-        #optimizer = flash.core.optimizers.LARS(model.parameters(), lr=1.5, momentum=0.9, weight_decay=1e-2)
-        optimizer = torch.optim.AdamW(set(model.parameters()), lr=learning_rate, weight_decay=weight_decay)
-
-        if conf["trainer"]["mode"] == "fsdp":
-            scaler = ShardedGradScaler(enabled=amp)
-        else:
-            scaler = GradScaler(enabled=amp)
-
-        scheduler = ReduceLROnPlateau(
-            optimizer,
-            patience=1,
-            min_lr=1.0e-13,
-            verbose=True
+    # will not check that the device is correct here
+    if conf["trainer"]["mode"] == "fsdp":
+        auto_wrap_policy = functools.partial(
+            size_based_auto_wrap_policy, min_num_params=1_000_000
         )
-    
-        # load optimizer and grad scaler states
-        if start_epoch > 0 and rank == 0:
-            logging.info(f"Loading optimizer, grad scaler, and learning rate scheduler states from {save_loc}")
+
+        model = FSDP(
+            vae,
+            use_orig_params=True,
+            auto_wrap_policy=auto_wrap_policy,
+            mixed_precision=torch.distributed.fsdp.MixedPrecision(
+                param_dtype=torch.float16, 
+                reduce_dtype=torch.float16, 
+                buffer_dtype=torch.float16, 
+                cast_forward_inputs=True
+            ),
+            #sharding_strategy=ShardingStrategy.FULL_SHARD # Zero3. Zero2 = ShardingStrategy.SHARD_GRAD_OP
+        )
         
+    elif conf["trainer"]["mode"] == "ddp":
+        model = DDP(vae, device_ids=[device], output_device=None)
+    else:
+        model = vae
+
+    # Load an optimizer, gradient scaler, and learning rate scheduler, the optimizer must come after wrapping model using FSDP
+    if start_epoch == 0: # Loaded after loading model weights when reloading
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    if conf["trainer"]["mode"] == "fsdp":
+        scaler = ShardedGradScaler(enabled=amp)
+    else:
+        scaler = GradScaler(enabled=amp)
+
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        patience=0,
+        min_lr=0.001 * learning_rate,
+        verbose=True
+    )
+
+    # load optimizer and grad scaler states
+    if start_epoch > 0:
+
+        checkpoint = torch.load(f"{save_loc}/checkpoint.pt", map_location=device)
+        
+        if conf["trainer"]["mode"] == "fsdp":
+            logging.info(f"Loading FSDP model, optimizer, grad scaler, and learning rate scheduler states from {save_loc}")
+
+            # wait for all workers to get the model loaded
+            torch.distributed.barrier()
+
+            # tell torch how we are loading the data in (e.g. sharded states)
+            FSDP.set_state_dict_type(
+                model,
+                StateDictType.SHARDED_STATE_DICT,
+            )
+            # different from ``torch.load()``, DCP requires model state_dict prior to loading to get
+            # the allocated storage and sharding information.
+            state_dict = {
+                "model_state_dict": model.state_dict(),
+            }
+            DCP.load_state_dict(
+                state_dict=state_dict,
+                storage_reader=DCP.FileSystemReader(os.path.join(save_loc, "checkpoint")),
+            )
+            model.load_state_dict(state_dict["model_state_dict"])
+            
+            # Load the optimizer here on all ranks
+            # https://github.com/facebookresearch/fairscale/issues/1083
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+            curr_opt_state_dict = checkpoint["optimizer_state_dict"]
+            optim_shard_dict = model.get_shard_from_optim_state_dict(curr_opt_state_dict)
+            # https://www.facebook.com/pytorch/videos/part-5-loading-and-saving-models-with-fsdp-full-state-dictionary/421104503278422/
+            # says to use scatter_full_optim_state_dict
+            optimizer.load_state_dict(optim_shard_dict)
+
+
+        elif conf["trainer"]["mode"] == "ddp":
+            logging.info(f"Loading DDP model, optimizer, grad scaler, and learning rate scheduler states from {save_loc}")
+            model.module.load_state_dict(checkpoint["model_state_dict"])
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        else:
+            logging.info(f"Loading model, optimizer, grad scaler, and learning rate scheduler states from {save_loc}")
+            model.load_state_dict(checkpoint["model_state_dict"]) 
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # Should not have to do this if we are doing this correctly ...
+        # make sure the loaded optimizer is on the same device as the reloaded model
+        # for state in optimizer.state.values():
+        #     for k, v in state.items():
+        #         if isinstance(v, torch.Tensor):
+        #             state[k] = v.to(device)
+        
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
 
     # Reload the results saved in the training csv if continuing to train
     if start_epoch == 0:
@@ -400,17 +446,17 @@ def trainer(rank, world_size, conf, trial=False):
         train_loss = []
 
         # set up a custom tqdm
-        
-        batches_per_epoch = len(train_loader)
+        batches_per_epoch = (
+            batches_per_epoch if 0 < batches_per_epoch < len(train_loader) else len(train_loader)
+        )
+
         batch_group_generator = tqdm.tqdm(
             range(batches_per_epoch), total=batches_per_epoch, leave=True
         )
 
-        for steps in batch_group_generator:
+        model.train()
 
-            # update generator 
-            
-            model.train()
+        for steps in batch_group_generator:
 
             # logs
 
@@ -434,8 +480,6 @@ def trainer(rank, world_size, conf, trial=False):
                         return_loss=True
                     )
                     
-                    del x, x_surf, y1, y1_surf
-                    
                     y2 = batch["y2"].to(device)
                     y2_surf = batch["y2_surf"].to(device)
                     
@@ -445,6 +489,12 @@ def trainer(rank, world_size, conf, trial=False):
                         return_recons=False,
                         return_loss=True
                     )
+
+                    if use_visual_ssl:
+                        loss += model(
+                            x.detach(), x_surf.detach(), 
+                            return_ssl_loss = True
+                        )
                     
                     scaler.scale(loss / grad_accum_every).backward()
 
@@ -461,40 +511,7 @@ def trainer(rank, world_size, conf, trial=False):
                 dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
             train_loss.append(batch_loss[0].item())
             
-            # update discriminator
-
-            # if model.discr is not None:
-            #     for _ in range(grad_accum_every):
-            #         batch = next(dl)
-            #         x = batch["x"].to(device)
-            #         y1 = batch["y1"].to(device)
-
-            #         with autocast(enabled=amp):
-            #             loss = model(x, y1, return_discr_loss=True)
-            #             discr_scaler.scale(loss / grad_accum_every).backward()
-
-            #         accum_log(logs, {'discr_loss': loss.item() / grad_accum_every})
-
-            #     if distributed:
-            #         torch.distributed.barrier()
-            #     discr_scaler.step(discr_optim)
-            #     discr_scaler.update()
-            #     discr_optim.zero_grad()
-
-            #     # log
-
-            #     print(f"{steps}: vae loss: {logs['loss']} - discr loss: {logs['discr_loss']}")
-
-            #     batch_disc_loss = torch.Tensor([logs["discr_loss"]]).cuda(device)
-            #     dist.all_reduce(batch_disc_loss, dist.ReduceOp.AVG, async_op=False)
-            #     results_dict["train_disc_loss"].append(batch_disc_loss[0])
-            
-            # update tqdm
-            # to_print = "Epoch {} train_loss: {:.6f} disc_loss: {:.6f}".format(
-            #     epoch, 
-            #     np.mean(results_dict["train_loss"]), 
-            #     np.mean(results_dict["train_disc_loss"])
-            # )
+            # update discriminator: not implemented yet
             
             to_print = "Epoch {} train_loss: {:.6f}".format(
                 epoch, 
@@ -502,14 +519,66 @@ def trainer(rank, world_size, conf, trial=False):
             )
             to_print += " lr: {:.12f}".format(optimizer.param_groups[0]["lr"])
             batch_group_generator.set_description(to_print)
-            batch_group_generator.update()
+            batch_group_generator.update(1)
             
         # Filter out non-float and NaN values from train_loss
         train_loss = [v for v in train_loss if isinstance(v, float) and np.isfinite(v)]
 
         # Shutdown the progbar
         batch_group_generator.close()
+                
+        if (not trial) and conf["trainer"]["mode"] != "fsdp": # rank == 0 and
+                
+            # Save the current model
+    
+            logging.info(f"Saving model, optimizer, grad scaler, and learning rate scheduler states to {save_loc}")
 
+            state_dict = {
+                "epoch": epoch,
+                "model_state_dict": model.module.state_dict() if conf["trainer"]["mode"] == "ddp" else model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict()
+            }
+            
+            #with open(f"{save_loc}/checkpoint.pkl", "wb") as f:
+            #    joblib.dump(state_dict, f)
+
+            torch.save(state_dict, f"{save_loc}/checkpoint_{device}.pt" if conf["trainer"]["mode"] == "ddp" else f"{save_loc}/checkpoint.pt")
+
+        elif not trial:
+
+            logging.info(f"Saving FSDP model, optimizer, grad scaler, and learning rate scheduler states to {save_loc}")
+            
+            # https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html
+            FSDP.set_state_dict_type(
+                model,
+                StateDictType.SHARDED_STATE_DICT,
+            )
+            sharded_state_dict = {
+                "model_state_dict": model.state_dict()
+            }
+            DCP.save_state_dict(
+                state_dict=sharded_state_dict,
+                storage_writer=DCP.FileSystemWriter(os.path.join(save_loc, "checkpoint")),
+            )
+            # save the optimizer
+            optimizer_state = FSDP.full_optim_state_dict(model, optimizer)
+            state_dict = {
+                "epoch": epoch,
+                "optimizer_state_dict": optimizer_state,
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict()
+            }
+            
+            #with open(f"{save_loc}/checkpoint.pkl", "wb") as f:
+            #    joblib.dump(state_dict, f)
+        
+            torch.save(state_dict, f"{save_loc}/checkpoint.pt")
+
+        #if distributed:
+        #    torch.distributed.barrier()
+            
         # clear the cached memory from the gpu
         torch.cuda.empty_cache()
         gc.collect()
@@ -522,15 +591,13 @@ def trainer(rank, world_size, conf, trial=False):
         
         model.eval()
 
-        # logs
-
-        logs = {}
-
         valid_loss = []
 
         # set up a custom tqdm
         
-        valid_batches_per_epoch = len(valid_loader)
+        valid_batches_per_epoch = (
+            valid_batches_per_epoch if 0 < valid_batches_per_epoch < len(valid_loader) else len(valid_loader)
+        )
         batch_group_generator = tqdm.tqdm(
             range(valid_batches_per_epoch), total=valid_batches_per_epoch, leave=True
         )
@@ -545,29 +612,50 @@ def trainer(rank, world_size, conf, trial=False):
                 x_surf = batch["x_surf"].to(device)
                 y1_surf = batch["y1_surf"].to(device)
     
-                with autocast(enabled=amp):
-                    y1_pred, y1_pred_surf, loss = model(
-                        x, x_surf, 
-                        y1, y1_surf,
-                        return_recons=True,
-                        return_loss=True
-                    )
-                    
-                    del x, x_surf, y1, y1_surf
-                    
-                    y2 = batch["y2"].to(device)
-                    y2_surf = batch["y2_surf"].to(device)
-                    
-                    loss += model(
-                        y1_pred.detach(), y1_pred_surf.detach(), 
-                        y2, y2_surf,
-                        return_recons=False,
-                        return_loss=True
-                    )
+#                 y1_pred, y1_pred_surf, loss = model(
+#                     x, x_surf, 
+#                     y1, y1_surf,
+#                     return_recons=True,
+#                     return_loss=True,
+#                     rk4_integration=True
+#                 )
                 
-                accum_log(logs, {'loss': loss.item()})
-    
-                batch_loss = torch.Tensor([logs["loss"]]).cuda(device)
+#                 del x, x_surf, y1, y1_surf
+                
+#                 y2 = batch["y2"].to(device)
+#                 y2_surf = batch["y2_surf"].to(device)
+                
+#                 loss += model(
+#                     y1_pred.detach(), y1_pred_surf.detach(), 
+#                     y2, y2_surf,
+#                     return_recons=False,
+#                     return_loss=True,
+#                     rk4_integration=True
+#                 )
+
+                y1_pred, y1_pred_surf = model(
+                    x, x_surf, 
+                    y1, y1_surf,
+                    return_recons=True,
+                    return_loss=False
+                )
+                
+                y2 = batch["y2"].to(device)
+                y2_surf = batch["y2_surf"].to(device)
+                
+                y2_pred, y2_pred_surf = model(
+                    y1_pred.detach(), y1_pred_surf.detach(), 
+                    y2, y2_surf,
+                    return_recons=True,
+                    return_loss=False
+                )
+                
+                loss = nn.L1Loss()(y1, y1_pred) 
+                loss += nn.L1Loss()(y1_surf, y1_pred_surf)
+                loss += nn.L1Loss()(y2, y2_pred)
+                loss += nn.L1Loss()(y2_surf, y2_pred_surf)
+                
+                batch_loss = torch.Tensor([loss.item()]).cuda(device)
                 if distributed:
                     dist.all_reduce(batch_loss, dist.ReduceOp.AVG, async_op=False)
                 valid_loss.append(batch_loss[0].item())
@@ -578,20 +666,24 @@ def trainer(rank, world_size, conf, trial=False):
                     epoch, np.mean(valid_loss)
                 )
                 batch_group_generator.set_description(to_print)
-                batch_group_generator.update()
+                batch_group_generator.update(1)
 
                 if k >= valid_batches_per_epoch and k > 0:
                     break
 
+                # Filter out non-float and NaN values from valid_loss
+                valid_loss = [v for v in valid_loss if isinstance(v, float) and np.isfinite(v)]
+
         # Shutdown the progbar
         batch_group_generator.close()
 
-        # Filter out non-float and NaN values from valid_loss
-        valid_loss = [v for v in valid_loss if isinstance(v, float) and np.isfinite(v)]
+        # Wait for rank-0 process to save the checkpoint above
+        if distributed:
+            torch.distributed.barrier()
 
         # clear the cached memory from the gpu
         torch.cuda.empty_cache()
-        gc.collect()   
+        gc.collect()  
 
         if trial:
             if not np.isfinite(np.mean(valid_loss)):
@@ -600,7 +692,6 @@ def trainer(rank, world_size, conf, trial=False):
         # Put things into a results dictionary -> dataframe
         results_dict["epoch"].append(epoch)
         results_dict["train_loss"].append(np.mean(train_loss))
-        #results_dict["train_disc_loss"].append(np.mean(train_disc_loss))
         results_dict["valid_loss"].append(np.mean(valid_loss))
         results_dict["learning_rate"].append(optimizer.param_groups[0]["lr"])
         
@@ -611,42 +702,17 @@ def trainer(rank, world_size, conf, trial=False):
 
         # Save the best model so far
         if not trial:
-            torch.distributed.barrier()
-                
-            if rank == 0:
-                
-                # Save the current model
-                
-                state_dict = {
-                    "epoch": epoch,
-                    "model_state_dict": model.module.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'scaler_state_dict': scaler.state_dict(),
-                    "loss": np.mean(valid_loss),
-                    "learning_rate": optimizer.param_groups[0]["lr"]
-                }
-                torch.save(state_dict, f"{save_loc}/model.pt")
-                
-                # joblib until checkpoint problems are resolved
-                
-                with open(f"{save_loc}/model.pkl", "wb") as f:
-                    joblib.dump({
-                        "epoch": epoch,
-                        "model": model.module,
-                        "optimizer": optimizer,
-                        'scheduler': scheduler,
-                        'scaler': scaler,
-                        "loss": np.mean(valid_loss),
-                        "learning_rate": optimizer.param_groups[0]["lr"]
-                    }, f)
-                
-                # save if this is the best model seen so far
-                
-                if np.mean(valid_loss) == min(results_dict["valid_loss"]):
-                    shutil.copy(f"{save_loc}/model.pt", f"{save_loc}/best.pt")
-                    shutil.copy(f"{save_loc}/model.pkl", f"{save_loc}/best.pkl")
-                    
+            # save if this is the best model seen so far
+            if (rank == 0) and (np.mean(valid_loss) == min(results_dict["valid_loss"])):
+                if conf["trainer"]["mode"] == "ddp":
+                    shutil.copy(f"{save_loc}/checkpoint_{device}.pt", f"{save_loc}/best_{device}.pt")
+                elif conf["trainer"]["mode"] == "fsdp":
+                    if os.path.exists(f"{save_loc}/best"):
+                        shutil.rmtree(f"{save_loc}/best")
+                    shutil.copytree(f"{save_loc}/checkpoint", f"{save_loc}/best")
+                else:
+                    shutil.copy(f"{save_loc}/checkpoint.pt", f"{save_loc}/best.pt")
+                #shutil.copy(f"{save_loc}/checkpoint.pkl", f"{save_loc}/checkpoint.pkl")
 
         # Save the dataframe to disk
         if trial:

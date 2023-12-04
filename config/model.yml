@@ -1,27 +1,29 @@
-save_loc: "./results/ddp"
+save_loc: "./results/ddp_ssl"
 seed: 1000
 
 
 data:
     variables: ['U','V','T','Q']
     surface_variables: ['SP','t2m','V500','U500','T500','Z500','Q500']
-    save_loc: '/glade/derecho/scratch/wchapman/STAGING/TOTAL_*'
-    mean_path: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.SLO.mean.nc'
-    std_path: '/glade/derecho/scratch/wchapman/STAGING/All_2010_staged.SLO.std.nc'
+    save_loc: '/glade/campaign/cisl/aiml/wchapman/MLWPS/STAGING/TOTAL_*'
+    mean_path: '/glade/campaign/cisl/aiml/wchapman/MLWPS/STAGING/All_2010_staged.SLO.mean.nc'
+    std_path: '/glade/campaign/cisl/aiml/wchapman/MLWPS/STAGING/All_2010_staged.SLO.std.nc'
 
 trainer:
     mode: ddp
-    train_batch_size: 4
-    valid_batch_size: 4
-    learning_rate: 1.0e-04
-    weight_decay: 0.0
+    train_batch_size: 2
+    valid_batch_size: 2
+    batches_per_epoch: 100 # Set to 0 to use len(dataloader)
+    valid_batches_per_epoch: 100
+    learning_rate: 1.0e-05
+    weight_decay: 1.0e-06
     start_epoch: 0
     epochs: 1000
     amp: False
     grad_accum_every: 1
     apply_grad_penalty: False
     grad_max_norm: 1.0
-    thread_workers: 4
+    thread_workers: 0
     stopping_patience: 50
 
 model:
@@ -32,18 +34,30 @@ model:
     frames: 15
     frame_patch_size: 5
     channels: 4
-    dim: 1024
+    surface_channels: 7
+    dim: 512
     layers: 6
-    dim_head: 1024
-    mlp_dim: 1024
+    dim_head: 512
+    mlp_dim: 512
     heads: 8
     depth: 4
+    rk4_integration: True
+    num_register_tokens: 4
+    use_registers: False
+    token_dropout: 0.0
+    use_visual_ssl: True
+    visual_ssl_weight: 0.05
     use_codebook: False
     vq_codebook_dim: 128
-    vq_codebook_size: 65536  # 2^16
-    vq_entropy_loss_weight: 0.8
-    vq_diversity_gamma: 1.0
-    discr_layers: 4
+    vq_codebook_size: 128 
+    vq_decay: 0.8
+    vq_commitment_weight: 1.0
+    use_vgg: False
+    use_spectral_loss: True
+    spectral_wavenum_init: 30
+    spectral_lambda_reg: 0.8
+    l2_recon_loss: False
+    use_hinge_loss: True
     
 pbs:
   script_name: "gwm"
