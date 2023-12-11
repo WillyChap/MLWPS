@@ -1,4 +1,4 @@
-save_loc: "./results/ddp_ssl"
+save_loc: "./results/casper/1209/unet"
 seed: 1000
 
 
@@ -8,56 +8,68 @@ data:
     save_loc: '/glade/campaign/cisl/aiml/wchapman/MLWPS/STAGING/TOTAL_*'
     mean_path: '/glade/campaign/cisl/aiml/wchapman/MLWPS/STAGING/All_2010_staged.SLO.mean.nc'
     std_path: '/glade/campaign/cisl/aiml/wchapman/MLWPS/STAGING/All_2010_staged.SLO.std.nc'
-
+    
 trainer:
-    mode: ddp
-    train_batch_size: 2
-    valid_batch_size: 2
-    batches_per_epoch: 100 # Set to 0 to use len(dataloader)
+    mode: none # none, ddp, fsdp
+    train_batch_size: 16
+    valid_batch_size: 16
+    batches_per_epoch: 500 # Set to 0 to use len(dataloader)
     valid_batches_per_epoch: 100
-    learning_rate: 1.0e-05
-    weight_decay: 1.0e-06
+    learning_rate: 5.0e-04
+    weight_decay: 1.0e-05
     start_epoch: 0
-    epochs: 1000
+    epochs: 100
     amp: False
     grad_accum_every: 1
     apply_grad_penalty: False
     grad_max_norm: 1.0
-    thread_workers: 0
+    thread_workers: 4
     stopping_patience: 50
 
 model:
     image_height: 640
-    patch_height: 64
+    patch_height: 16
     image_width: 1280
-    patch_width: 64
+    patch_width: 16
     frames: 15
-    frame_patch_size: 5
+    frame_patch_size: 3
     channels: 4
     surface_channels: 7
-    dim: 512
+    dim: 1024
     layers: 6
-    dim_head: 512
-    mlp_dim: 512
+    dim_head: 1024
+    mlp_dim: 1024
     heads: 8
     depth: 4
-    rk4_integration: True
-    num_register_tokens: 4
+    rk4_integration: False
     use_registers: False
+    num_register_tokens: 4
     token_dropout: 0.0
-    use_visual_ssl: True
-    visual_ssl_weight: 0.05
+    use_visual_ssl: False
+    visual_ssl_weight: 0.0
     use_codebook: False
-    vq_codebook_dim: 128
-    vq_codebook_size: 128 
+    vq_codebook_dim: 16
+    vq_codebook_size: 256
     vq_decay: 0.8
     vq_commitment_weight: 1.0
     use_vgg: False
-    use_spectral_loss: True
+    use_spectral_loss: False
     spectral_wavenum_init: 30
     spectral_lambda_reg: 0.8
-    l2_recon_loss: False
-    use_hinge_loss: True
+    l2_recon_loss: True
+    
+weights:
+    U: [0.132, 0.123, 0.113, 0.104, 0.095, 0.085, 0.076, 0.067, 0.057, 0.048, 0.039, 0.029, 0.02 , 0.011, 0.005]
+    V: [0.132, 0.123, 0.113, 0.104, 0.095, 0.085, 0.076, 0.067, 0.057, 0.048, 0.039, 0.029, 0.02 , 0.011, 0.005]
+    T: [0.132, 0.123, 0.113, 0.104, 0.095, 0.085, 0.076, 0.067, 0.057, 0.048, 0.039, 0.029, 0.02 , 0.011, 0.005]
+    Q: [0.132, 0.123, 0.113, 0.104, 0.095, 0.085, 0.076, 0.067, 0.057, 0.048, 0.039, 0.029, 0.02 , 0.011, 0.005]
+    SP: 0.1
+    t2m: 1.0
+    V500: 0.1
+    U500: 0.1
+    T500: 0.1
+    Z500: 0.1
+    Q500: 0.1
     
 pbs:
   script_name: "gwm"

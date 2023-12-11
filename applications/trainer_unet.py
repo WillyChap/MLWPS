@@ -40,7 +40,6 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
     BackwardPrefetch,
 )
 from torch.distributed.fsdp.wrap import (
-    transformer_auto_wrap_policy,
     size_based_auto_wrap_policy,
     enable_wrap,
     wrap
@@ -56,6 +55,7 @@ import joblib
 from torch.distributed.fsdp import StateDictType
 from torch.distributed.fsdp import FullStateDictConfig
 from torch.distributed.fsdp import FullOptimStateDictConfig
+import segmentation_models_pytorch as smp
 
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -121,7 +121,7 @@ def launch_pbs_jobs(config):
     jobid = jobid.decode("utf-8").strip("\n")
     print(jobid)
     os.remove("launcher.sh")
-    
+
 
 def trainer(rank, world_size, conf, trial=False):
     if conf["trainer"]["mode"] in ["fsdp", "ddp"]:
@@ -293,38 +293,14 @@ def trainer(rank, world_size, conf, trial=False):
     
     dl = cycle(train_loader)
     valid_dl = cycle(valid_loader)
-
-    # model 
-    vae = ViTEncoderDecoder(
-        image_height=image_height,
-        patch_height=patch_height,
-        image_width=image_width,
-        patch_width=patch_width,
-        frames=frames,
-        frame_patch_size=frame_patch_size,
-        dim=dim,
-        channels=channels,
-        surface_channels=surface_channels,
-        depth=depth,
-        heads=heads,
-        dim_head=dim_head,
-        mlp_dim=mlp_dim,
-        rk4_integration=rk4_integration,
-        num_register_tokens=num_register_tokens,
-        use_registers=use_registers,
-        token_dropout=token_dropout,
-        use_codebook=use_codebook,
-        vq_codebook_size=vq_codebook_size,
-        vq_decay=vq_decay,
-        vq_commitment_weight=vq_commitment_weight,
-        use_vgg=use_vgg,
-        use_visual_ssl=use_visual_ssl,
-        visual_ssl_weight=visual_ssl_weight,
-        use_spectral_loss=use_spectral_loss,
-        spectral_wavenum_init=spectral_wavenum_init,
-        spectral_lambda_reg=spectral_lambda_reg,
-        l2_recon_loss=l2_recon_loss,
-        use_hinge_loss=use_hinge_loss
+    
+    # model
+    vae = smp.Unet(
+        encoder_name="resnet34",        # choose encoder, e.g. mobilenet_v2 or efficientnet-b7
+        encoder_weights="imagenet",     # use `imagenet` pre-trained weights for encoder initialization
+        decoder_attention_type="scse",
+        in_channels=67,                  # model input channels (1 for gray-scale images, 3 for RGB, etc.)
+        classes=67,                      # model output channels (number of classes in your dataset)
     )
 
     num_params = sum(p.numel() for p in vae.parameters())
@@ -376,8 +352,6 @@ def trainer(rank, world_size, conf, trial=False):
     #     min_lr=0.001 * learning_rate,
     #     verbose=True
     # )
-    
-    scheduler = LambdaLR(optimizer, lr_lambda = lr_lambda_phase1)
 
     # load optimizer and grad scaler states
     if start_epoch > 0:
@@ -435,6 +409,8 @@ def trainer(rank, world_size, conf, trial=False):
         #         if isinstance(v, torch.Tensor):
         #             state[k] = v.to(device)
         
+        # Load LR scheduler
+        scheduler = LambdaLR(optimizer, lr_lambda = lr_lambda_phase1)    
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
             
@@ -442,6 +418,7 @@ def trainer(rank, world_size, conf, trial=False):
     # Reload the results saved in the training csv if continuing to train
     if start_epoch == 0:
         results_dict = defaultdict(list)
+        scheduler = LambdaLR(optimizer, lr_lambda = lr_lambda_phase1)
     else:
         results_dict = defaultdict(list)
         saved_results = pd.read_csv(f"{save_loc}/training_log.csv")
@@ -484,22 +461,24 @@ def trainer(rank, world_size, conf, trial=False):
                 y1 = batch["y1"].to(device)
                 x_surf = batch["x_surf"].to(device)
                 y1_surf = batch["y1_surf"].to(device)
+                
+                # Reshape x and y1 to (b, c*f, h, w)
+                x = x.view(x.shape[0], -1, x.shape[3], x.shape[4])
+                y1 = y1.view(y1.shape[0], -1, y1.shape[3], y1.shape[4])
+
+                # Concatenate along the width dimension
+                x = torch.cat((x, x_surf), dim=1)
+                y1 = torch.cat((y1, y1_surf), dim=1)
 
                 with autocast(enabled=amp):
                     
-                    y1_pred, y1_pred_surf, loss = model(
-                        x, x_surf, 
-                        y1, y1_surf,
-                        tendency_scaler=tendency_scaler,
-                        atmosphere_weights=weights_UVTQ.to(device),
-                        surface_weights=weights_sfc.to(device),
-                        return_recons=True,
-                        return_loss=True,
-                    )
+                    y1_pred = model(x)
                     
+                    loss = torch.nn.MSELoss()(y1, y1_pred)
+
 #                     y2 = batch["y2"].to(device)
 #                     y2_surf = batch["y2_surf"].to(device)
-                    
+
 #                     loss += model(
 #                         y1_pred.detach(), y1_pred_surf.detach(), 
 #                         y2, y2_surf,
@@ -507,12 +486,6 @@ def trainer(rank, world_size, conf, trial=False):
 #                         return_recons=False,
 #                         return_loss=True
 #                     )
-
-                    if use_visual_ssl:
-                        loss += model(
-                            x.detach(), x_surf.detach(),
-                            return_ssl_loss = True
-                        )
                     
                     scaler.scale(loss / grad_accum_every).backward()
 
@@ -633,22 +606,18 @@ def trainer(rank, world_size, conf, trial=False):
                 x_surf = batch["x_surf"].to(device)
                 y1_surf = batch["y1_surf"].to(device)
                 
-                y1_pred, y1_pred_surf = model(
-                    x, x_surf,
-                    y1, y1_surf,
-                    tendency_scaler=tendency_scaler,
-                    return_recons=True
-                )
+                # Reshape x and y1 to (b, c*f, h, w)
+                x = x.view(x.shape[0], -1, x.shape[3], x.shape[4])
+                y1 = y1.view(y1.shape[0], -1, y1.shape[3], y1.shape[4])
+
+                # Concatenate along the width dimension
+                x = torch.cat((x, x_surf), dim=1)
+                y1 = torch.cat((y1, y1_surf), dim=1)
                 
-                #loss = nn.L1Loss()(y1, y1_pred) 
-                #loss += nn.L1Loss()(y1_surf, y1_pred_surf)
+                y1_pred = model(x)
                 
-                delta, delta_surf = tendency_scaler.transform(y1-x, y1_surf-x_surf)
-                delta_pred, delta_pred_surf = tendency_scaler.transform(y1_pred-x, y1_pred_surf-x_surf)
-                
-                loss = nn.L1Loss()(delta, delta_pred) 
-                loss += nn.L1Loss()(delta_surf, delta_pred_surf)
-    
+                loss = nn.L1Loss()(y1, y1_pred) 
+
 #                 y1_pred, y1_pred_surf, loss = model(
 #                     x, x_surf,
 #                     y1, y1_surf,
@@ -667,11 +636,6 @@ def trainer(rank, world_size, conf, trial=False):
 #                     return_recons=False,
 #                     return_loss=True
 #                 )
-
-                #loss = nn.L1Loss()(y1, y1_pred) 
-                #loss += nn.L1Loss()(y1_surf, y1_pred_surf)
-                #loss += nn.L1Loss()(y2, y2_pred)
-                #loss += nn.L1Loss()(y2_surf, y2_pred_surf)
                 
                 batch_loss = torch.Tensor([loss.item()]).cuda(device)
                 if distributed:

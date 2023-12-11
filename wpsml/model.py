@@ -10,10 +10,42 @@ from einops.layers.torch import Rearrange
 import torch.nn.functional as F
 from torch.autograd import grad as torch_grad
 import torchvision
-from wpsml.pe import PosEmb3D, SurfacePosEmb2D, GraphPositionBias
+from wpsml.pe import PosEmb3D, SurfacePosEmb2D, CombinedPosEmb
 from wpsml.visual_ssl import SimSiam, MLP
-from wpsml.loss import SpectralLoss, SpectralLossSurface
+from wpsml.loss import SpectralLoss, SpectralLossSurface, MSLELoss, WeightedMSELoss, WeightedMSELossSurface
 from functools import partial
+from vector_quantize_pytorch import VectorQuantize
+
+
+class SimpleModel(nn.Module):
+    def __init__(self, color_dim, surface_dim):
+        super(SimpleModel, self).__init__()
+
+        # Shared layers
+        self.conv = nn.Conv3d(color_dim, 64, kernel_size=3, stride=1, padding=1)
+        self.relu = nn.ReLU()
+
+        # Color prediction head
+        self.conv_transpose_color = nn.ConvTranspose3d(64, color_dim, kernel_size=3, stride=1, padding=1)
+        self.loss_fn_color = nn.MSELoss()
+
+        # Surface detail prediction head
+        self.conv_transpose_surface = nn.ConvTranspose2d(1, surface_dim, kernel_size=3, stride=1, padding=1)  # Using ConvTranspose2d for 2D prediction
+        self.loss_fn_surface = nn.MSELoss()
+
+    def forward(self, x, x_surface, y, y_surface):
+        # Process 3D input
+        x = self.conv(x)
+        x = self.relu(x)
+        x = self.conv_transpose_color(x)
+        loss = self.loss_fn_color(x, y)
+
+        # Process 2D input
+        x_surface = self.conv_transpose_surface(x_surface)  # Add channel dimension
+        x_surface = x_surface.squeeze(1)  # Remove channel dimension after prediction
+        loss_surface = self.loss_fn_surface(x_surface, y_surface)
+
+        return x, x_surface, loss+loss_surface
 
 
 
@@ -151,7 +183,21 @@ class ViTEncDecSurface(nn.Module):
             heads = heads,
             mlp_dim = mlp_dim
         )
+        self.transformer_encoder_surf = Transformer(
+            dim = dim,
+            depth = depth,
+            dim_head = dim_head,
+            heads = heads,
+            mlp_dim = mlp_dim
+        )
         self.transformer_decoder = Transformer(
+            dim = dim,
+            depth = depth,
+            dim_head = dim_head,
+            heads = heads,
+            mlp_dim = mlp_dim
+        )
+        self.transformer_decoder_surf = Transformer(
             dim = dim,
             depth = depth,
             dim_head = dim_head,
@@ -168,6 +214,9 @@ class ViTEncDecSurface(nn.Module):
         self.encoder_embed = Rearrange('b c (f pf) (h p1) (w p2) -> b (f h w) (p1 p2 pf c)', p1=patch_height, p2=patch_width, pf=frame_patch_size)
         self.encoder_linear = nn.Linear(input_dim, dim)
         
+        self.encoder_layer_norm = nn.LayerNorm(dim)
+        self.encoder_surface_layer_norm = nn.LayerNorm(dim)
+        
         self.encoder_surface_embed = Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_height, p2=patch_width, c=surface_channels) 
         self.encoder_surface_linear = nn.Linear(input_dim_surface, dim)
         
@@ -177,6 +226,9 @@ class ViTEncDecSurface(nn.Module):
         self.decoder_rearrange = Rearrange('b (f h w) (p1 p2 pf c) -> b c (pf f) (p1 h) (w p2)',  
                                            h=(image_height // patch_height), f=(frames // frame_patch_size),  
                                            p1=patch_height, p2=patch_width, pf=frame_patch_size)
+        
+        self.decoder_layer_norm = nn.LayerNorm(4 * dim)
+        self.decoder_surface_layer_norm = nn.LayerNorm(4 * dim)
                                            
         self.decoder_surface_linear_1 = nn.Linear(dim, dim * 4)
         self.decoder_surface_linear_2 = nn.Linear(dim * 4, input_dim_surface)
@@ -210,10 +262,17 @@ class ViTEncDecSurface(nn.Module):
                 decay = vq_decay,             # the exponential moving average decay, lower means the dictionary will change faster
                 commitment_weight = vq_commitment_weight  # the weight on the commitment loss
             )
+            self.vq_surf = VectorQuantize(
+                dim = dim,
+                codebook_size = vq_codebook_size,     # codebook size
+                decay = vq_decay,             # the exponential moving average decay, lower means the dictionary will change faster
+                commitment_weight = vq_commitment_weight  # the weight on the commitment loss
+            )
                                                    
     def encode(self, x, x_surf):
         x = self.encoder_embed(x)
-        x = self.encoder_linear(x)  
+        x = self.encoder_linear(x)
+        x = self.encoder_layer_norm(x)
         x = self.pos_embedding(x)
         x = self.token_dropout(x)
         if self.use_registers:
@@ -225,12 +284,13 @@ class ViTEncDecSurface(nn.Module):
         
         x_surf = self.encoder_surface_embed(x_surf)
         x_surf = self.encoder_surface_linear(x_surf)
+        x_surf = self.encoder_surface_layer_norm(x_surf)
         x_surf = self.surface_pos_embedding(x_surf)
         x_surf = self.token_dropout(x_surf)
         if self.use_registers:
             r = repeat(self.register_tokens, 'n d -> b n d', b = x_surf.shape[0])
             x_surf, ps = pack([x_surf, r], 'b * d')
-        x_surf = self.transformer_encoder(x_surf)
+        x_surf = self.transformer_encoder_surf(x_surf)
         if self.use_registers:
             x_surf, _ = unpack(x_surf, ps, 'b * d')
         
@@ -246,7 +306,8 @@ class ViTEncDecSurface(nn.Module):
             x, _ = unpack(x, ps, 'b * d')
         
         x = self.decoder_linear_1(x) 
-        x = F.tanh(x)
+        #x = F.tanh(x)
+        x = self.decoder_layer_norm(x)
         x = self.decoder_linear_2(x)
         x = self.decoder_rearrange(x)
 
@@ -254,15 +315,183 @@ class ViTEncDecSurface(nn.Module):
         if self.use_registers:
             r = repeat(self.register_tokens, 'n d -> b n d', b = x_surf.shape[0])
             x_surf, ps = pack([x_surf, r], 'b * d')
-        x_surf = self.transformer_decoder(x_surf)
+        x_surf = self.transformer_decoder_surf(x_surf)
         if self.use_registers:
             x_surf, _ = unpack(x_surf, ps, 'b * d')
         
         x_surf = self.decoder_surface_linear_1(x_surf)
-        x_surf = F.tanh(x_surf)
+        #x_surf = F.tanh(x_surf)
+        x_surf = self.decoder_surface_layer_norm(x_surf)
         x_surf = self.decoder_surface_linear_2(x_surf)
         x_surf = self.decoder_surface_rearrange(x_surf)
         
+        return x, x_surf
+    
+    
+class CombinedViT(nn.Module):
+    def __init__(
+        self,
+        image_height, 
+        patch_height,
+        image_width,
+        patch_width,
+        frames, 
+        frame_patch_size,
+        dim,
+        channels = 4,
+        surface_channels = 7,
+        depth = 4,
+        heads = 8,
+        dim_head = 32,
+        mlp_dim = 32, 
+        use_registers = False,
+        num_register_tokens = 0,
+        token_dropout = 0.0,
+        use_codebook = False,
+        vq_codebook_size = 128,
+        vq_decay = 0.1,
+        vq_commitment_weight = 1.0
+    ):
+                 
+        super().__init__()
+
+        # Encoder-decoder layers 
+        self.transformer_encoder = Transformer(
+            dim = dim,
+            depth = depth,
+            dim_head = dim_head,
+            heads = heads,
+            mlp_dim = mlp_dim
+        )
+        self.transformer_decoder = Transformer(
+            dim = dim,
+            depth = depth,
+            dim_head = dim_head,
+            heads = heads,
+            mlp_dim = mlp_dim
+        )
+        
+        # Input/output dimensions
+        self.num_patches = (image_height // patch_height) * (image_width // patch_width) * (frames // frame_patch_size)  
+        self.num_patches_surf = (image_height // patch_height) * (image_width // patch_width)
+        input_dim = channels * patch_height * patch_width * frame_patch_size
+        input_dim_surface = surface_channels * patch_height * patch_width
+        
+        # Encoder layers 
+        self.encoder_embed = Rearrange('b c (f pf) (h p1) (w p2) -> b (f h w) (p1 p2 pf c)', p1=patch_height, p2=patch_width, pf=frame_patch_size)
+        self.encoder_linear = nn.Linear(input_dim, dim)
+        self.encoder_layer_norm = nn.LayerNorm(dim)
+        self.encoder_layer_norm_cat = nn.LayerNorm(dim)
+        
+        self.encoder_surface_embed = Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_height, p2=patch_width, c=surface_channels) 
+        self.encoder_surface_linear = nn.Linear(input_dim_surface, dim)
+        self.encoder_surface_layer_norm = nn.LayerNorm(dim)
+        
+        # Decoder layers
+        self.decoder_linear_1 = nn.Linear(dim, dim * 4)
+        self.decoder_linear_2 = nn.Linear(dim * 4, input_dim)
+        self.decoder_layer_norm_1 = nn.LayerNorm(4 * dim)
+        self.decoder_layer_norm_2 = nn.LayerNorm(input_dim)
+        self.decoder_rearrange = Rearrange('b (f h w) (p1 p2 pf c) -> b c (pf f) (p1 h) (w p2)',  
+                                           h=(image_height // patch_height), f=(frames // frame_patch_size),  
+                                           p1=patch_height, p2=patch_width, pf=frame_patch_size)
+        
+                                           
+        self.decoder_surface_linear_1 = nn.Linear(dim, dim * 4)
+        self.decoder_surface_linear_2 = nn.Linear(dim * 4, input_dim_surface)
+        self.decoder_surface_layer_norm_1 = nn.LayerNorm(4 * dim)
+        self.decoder_surface_layer_norm_2 = nn.LayerNorm(input_dim_surface)
+        self.decoder_surface_rearrange = Rearrange('b (h w) (p1 p2 c) -> b c (p1 h) (w p2)',  
+                                                   w=(image_width // patch_width), c=surface_channels,  
+                                                   p1=patch_height, p2=patch_width)
+
+        # Positional embeddings
+        self.pos_embedding = PosEmb3D(
+            frames, image_height, image_width, frame_patch_size, patch_height, patch_width, dim
+        )
+
+        self.surface_pos_embedding = SurfacePosEmb2D(
+            image_height, image_width, patch_height, patch_width, dim
+        )
+        # Decoder PE
+        self.decoder_pos_embedding = CombinedPosEmb(
+            frames, image_height, image_width, frame_patch_size, patch_height, patch_width, dim
+        )
+        
+        # Token / patch drop
+        self.token_dropout = PatchDropout(token_dropout) if token_dropout > 0.0 else nn.Identity()
+
+        # Vision Transformers Need Registers, https://arxiv.org/abs/2309.16588
+        self.use_registers = use_registers
+        if self.use_registers:
+            self.register_tokens = nn.Parameter(torch.randn(num_register_tokens, dim))
+
+        # codebook
+        self.use_codebook = use_codebook
+        if  self.use_codebook:
+            self.vq = VectorQuantize(
+                dim = dim,
+                codebook_size = vq_codebook_size,     # codebook size
+                decay = vq_decay,             # the exponential moving average decay, lower means the dictionary will change faster
+                commitment_weight = vq_commitment_weight  # the weight on the commitment loss
+            )
+ 
+
+    def encode(self, x, x_surf):
+        x = self.encoder_embed(x)
+        x = self.encoder_linear(x)
+        x = self.encoder_layer_norm(x)
+        x = self.pos_embedding(x)
+
+        x_surf = self.encoder_surface_embed(x_surf)
+        x_surf = self.encoder_surface_linear(x_surf)
+        x_surf = self.encoder_surface_layer_norm(x_surf)
+        x_surf = self.surface_pos_embedding(x_surf)
+        
+        # Concatenate x and x_surf along the sequence dimension then normalize
+        x = torch.cat((x, x_surf), dim=1)
+        x = self.encoder_layer_norm_cat(x)
+        
+        # Attend
+        x = self.token_dropout(x)
+        if self.use_registers:
+            r = repeat(self.register_tokens, 'n d -> b n d', b = x.shape[0])
+            x, ps = pack([x, r], 'b * d')
+        x = self.transformer_encoder(x)
+        if self.use_registers:
+            x, _ = unpack(x, ps, 'b * d')
+        
+        return x
+        
+    def decode(self, x):
+        x = self.decoder_pos_embedding(x)
+
+        # Attend
+        if self.use_registers:
+            r = repeat(self.register_tokens, 'n d -> b n d', b = x.shape[0])
+            x, ps = pack([x, r], 'b * d')
+        x = self.transformer_decoder(x)
+        if self.use_registers:
+            x, _ = unpack(x, ps, 'b * d')
+
+        # Split the output back into x and x_surf
+        x, x_surf = torch.split(x, [self.num_patches, self.num_patches_surf], dim=1)
+
+        # Now reshape the two terms
+        # x
+        x = self.decoder_linear_1(x) 
+        x = self.decoder_layer_norm_1(x)
+        x = self.decoder_linear_2(x)
+        x = self.decoder_layer_norm_2(x)
+        x = self.decoder_rearrange(x)
+
+        # x_surf
+        x_surf = self.decoder_surface_linear_1(x_surf)
+        x_surf = self.decoder_surface_layer_norm_1(x_surf)
+        x_surf = self.decoder_surface_linear_2(x_surf)
+        x_surf = self.decoder_surface_layer_norm_2(x_surf)
+        x_surf = self.decoder_surface_rearrange(x_surf)
+
         return x, x_surf
     
 
@@ -304,7 +533,7 @@ class ViTEncoderDecoder(nn.Module):
         
         self.channels = channels
         
-        self.enc_dec = ViTEncDecSurface(
+        self.enc_dec = CombinedViT( #ViTEncDecSurface(
             image_height, 
             patch_height, 
             image_width,
@@ -331,7 +560,15 @@ class ViTEncoderDecoder(nn.Module):
         self.rk4_integration = rk4_integration
 
         # reconstruction loss
-        self.recon_loss_fn = F.mse_loss if l2_recon_loss else F.l1_loss
+        if l2_recon_loss:
+            self.recon_loss = nn.MSELoss(reduction='none')
+            self.recon_loss_surf = nn.MSELoss(reduction='none')
+        else:
+            self.recon_loss = F.l1_loss
+            self.recon_loss_surf = F.l1_loss
+            
+        #self.recon_loss = F.mse_loss if l2_recon_loss else F.l1_loss
+        #self.recon_loss_surf = F.mse_loss if l2_recon_loss else F.l1_loss
 
         # ssl -- makes more sense to move this to the model class above which contains all layers
         self.visual_ssl = None
@@ -369,12 +606,17 @@ class ViTEncoderDecoder(nn.Module):
             
 
     def encode(self, fmap, fmap_surface):
-        fmap, fmap_surface = self.enc_dec.encode(fmap, fmap_surface)
-        return fmap, fmap_surface
+        return self.enc_dec.encode(fmap, fmap_surface)
 
-    def decode(self, fmap, fmap_surface):
-        #fmap, indices, commit_loss = self.enc_dec.vq(fmap)
-        fmap, fmap_surface = self.enc_dec.decode(fmap, fmap_surface)
+    def decode(self, z):
+        
+        if self.enc_dec.use_codebook:
+            fmap, indices, commit_loss = self.enc_dec.vq(z)
+            #fmap_surface, indices_surface, commit_loss_surface = self.enc_dec.vq_surf(fmap_surface)
+            fmap, fmap_surface = self.enc_dec.decode(z)
+            return fmap, fmap_surface, commit_loss
+        
+        fmap, fmap_surface = self.enc_dec.decode(z)
 
         return fmap, fmap_surface
     
@@ -384,6 +626,9 @@ class ViTEncoderDecoder(nn.Module):
         img_surface,
         y_img = False,
         y_img_surface = False,
+        tendency_scaler = None,
+        atmosphere_weights = None,
+        surface_weights = None,
         return_loss = False,
         return_recons = False,
         return_ssl_loss = False
@@ -398,75 +643,107 @@ class ViTEncoderDecoder(nn.Module):
         # autoencoder
 
         if self.rk4_integration:
+            
             # RK4 steps for encoded result
-            k1, k1_surf = self.decode(*self.encode(img, img_surface))
-            k2, k2_surf = self.decode(*self.encode(img + 0.5 * k1, img_surface + 0.5 * k1_surf))
-            k3, k3_surf = self.decode(*self.encode(img + 0.5 * k2, img_surface + 0.5 * k2_surf))
-            k4, k4_surf = self.decode(*self.encode(img + k3, img_surface + k3_surf))
-            fmap = img + (k1 + 2 * k2 + 2 * k3 + k4) / 6
-            fmap_surface = img_surface + (k1_surf + 2 * k2_surf + 2 * k3_surf + k4_surf) / 6
+            
+            k1, k1_surf = self.decode(self.encode(img, img_surface))
+            k2, k2_surf = self.decode(self.encode(img + 0.5 * k1, img_surface + 0.5 * k1_surf))
+            k3, k3_surf = self.decode(self.encode(img + 0.5 * k2, img_surface + 0.5 * k2_surf))
+            k4, k4_surf = self.decode(self.encode(img + k3, img_surface + k3_surf))
+            
+            # should be z-scores of tendencies
+            
+            pred_tendency = (k1 + 2 * k2 + 2 * k3 + k4) / 6
+            pred_tendency_surf = (k1_surf + 2 * k2_surf + 2 * k3_surf + k4_surf) / 6
+            
+            # Undo the z-score output (tendency) of the model
+            
+            unscaled_tend, unscaled_tend_surf = tendency_scaler.inverse_transform(
+                pred_tendency,
+                pred_tendency_surf
+            )
+            
+            # Step
+            
+            fmap = img + unscaled_tend
+            fmap_surface = img_surface + unscaled_tend_surf
 
         else:
-            fmap, fmap_surface = self.encode(img, img_surface)
-            fmap, fmap_surface = self.decode(fmap, fmap_surface)
-
-        
+            z = self.encode(img, img_surface)
+            
+            if self.enc_dec.use_codebook:
+                fmap, fmap_surface, cm_loss = self.decode(z)
+            else:
+                fmap, fmap_surface = self.decode(z)
+                
+            pred_tendency, pred_tendency_surf = tendency_scaler.transform(fmap-img, fmap_surface-img_surface)
+            
+            
         if not return_loss:
             return fmap, fmap_surface
-
+        
+        
+        # Convert true tendencies to z-scores
+        
+        true_tendency, true_tendency_surf = tendency_scaler.transform(y_img-img, y_img_surface-img_surface)
+        
         # reconstruction loss
         
-        recon_loss = self.recon_loss_fn(y_img, fmap)
-        recon_loss_surface = self.recon_loss_fn(y_img_surface, fmap_surface)
+        if atmosphere_weights is not None and surface_weights is not None:
+            recon_loss = (self.recon_loss(true_tendency, pred_tendency) * atmosphere_weights).mean()
+            recon_loss_surface = (self.recon_loss_surf(true_tendency_surf, pred_tendency_surf) * surface_weights).mean()
+        
+        else:
+            recon_loss = self.recon_loss(true_tendency, pred_tendency).mean()
+            recon_loss_surface = self.recon_loss_surf(true_tendency_surf, pred_tendency_surf).mean()
 
         # fourier spectral loss
+        
         spec_loss = 0.0
         if self.use_spectral_loss:
-            spec_loss_1 = self.spectral_loss(y_img, fmap)
-            spec_loss_2 = self.spectral_loss_surface(y_img_surface, fmap_surface)
+            spec_loss_1 = self.spectral_loss(true_tendency, pred_tendency)
+            spec_loss_2 = self.spectral_loss_surface(true_tendency_surf, pred_tendency_surf)
             spec_loss = 0.5 * (spec_loss_1 + spec_loss_2)
         
         # Add terms
         
         loss = self.spectral_lambda_reg * (recon_loss + recon_loss_surface) + (1 - self.spectral_lambda_reg) * spec_loss
+        
+        if self.enc_dec.use_codebook:
+            loss += cm_loss.squeeze()
 
         if return_recons:
             return fmap, fmap_surface, loss
-        
-        # perceptual
-        # img_vgg_input = img
-        # fmap_vgg_input = fmap
-        
-        # # in the dall-e example, there are no frames (pressure levels). here we loop over them and sum the losses
-        # for i in range(img_vgg_input.shape[2]):
-        #     # Get the i-th frame from the original and reconstructed videos
-        #     img_frame = img_vgg_input[:, :, i, :, :]
-        #     fmap_frame = fmap_vgg_input[:, :, i, :, :]
-
-        #     # Compute VGG features for the original and reconstructed frames
-        #     img_vgg_feats = self.vgg(img_frame)
-        #     recon_vgg_feats = self.vgg(fmap_frame)
-
-        #     # Compute the perceptual loss (MSE loss between VGG features)
-        #     perceptual_loss = F.mse_loss(img_vgg_feats, recon_vgg_feats)
-
-        #     #print(i, perceptual_loss)
-        #     # generator loss
-        #     #gen_loss = self.gen_loss(self.discr(fmap_frame))
-
-        #     # calculate adaptive weight
-        #     #last_dec_layer = self.enc_dec.last_dec_layer
-        #     #norm_grad_wrt_gen_loss = 1.0 #grad_layer_wrt_loss(gen_loss, last_dec_layer).norm(p = 2)
-        #     #norm_grad_wrt_perceptual_loss = 1.0 #grad_layer_wrt_loss(perceptual_loss, last_dec_layer).norm(p = 2)
-
-        #     #print(norm_grad_wrt_perceptual_loss, norm_grad_wrt_gen_loss)
-        #     #adaptive_weight = safe_div(norm_grad_wrt_perceptual_loss, norm_grad_wrt_gen_loss)
-        #     #adaptive_weight.clamp_(max = 1e4)
-
-        #     # combine losses
-        #     loss += perceptual_loss #(perceptual_loss + adaptive_weight * gen_loss)
 
         return loss
+    
+    
+    
+#         # reconstruction loss
+        
+#         recon_loss = self.recon_loss_fn(y_img, fmap)
+#         recon_loss_surface = self.recon_loss_fn(y_img_surface, fmap_surface)
+
+#         # fourier spectral loss
+        
+#         spec_loss = 0.0
+#         if self.use_spectral_loss:
+#             spec_loss_1 = self.spectral_loss(y_img, fmap)
+#             spec_loss_2 = self.spectral_loss_surface(y_img_surface, fmap_surface)
+#             spec_loss = 0.5 * (spec_loss_1 + spec_loss_2)
+        
+#         # Add terms
+        
+#         loss = self.spectral_lambda_reg * (recon_loss + recon_loss_surface) + (1 - self.spectral_lambda_reg) * spec_loss
+        
+#         if self.enc_dec.use_codebook:
+#             loss += (cm_loss + cm_loss_surf).squeeze()
+
+#         if return_recons:
+#             return fmap + img, fmap_surface + img_surface, loss
+
+#         return loss
+
 
 
 if __name__ == "__main__":

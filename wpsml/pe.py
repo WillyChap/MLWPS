@@ -145,3 +145,33 @@ class SurfacePosEmb2D(nn.Module):
     def forward(self, x):
         return x + self.embedding.to(dtype=x.dtype, device=x.device)
 
+
+class CombinedPosEmb(nn.Module):
+    def __init__(self, frames, image_height, image_width, frame_patch_size, patch_height, patch_width, dim, temperature=10000):
+        super(CombinedPosEmb, self).__init__()
+        
+        self.num_patches = (image_height // patch_height) * (image_width // patch_width) * (frames // frame_patch_size)  
+        self.num_patches_surf = (image_height // patch_height) * (image_width // patch_width)
+        
+        # Initialize the 3D position embedding
+        self.pos_emb_3d = PosEmb3D(
+            frames, image_height, image_width, frame_patch_size, patch_height, patch_width, dim, temperature
+        )
+        
+        # Initialize the 2D position embedding
+        self.pos_emb_2d = SurfacePosEmb2D(
+            image_height, image_width, patch_height, patch_width, dim, temperature
+        )
+
+    def forward(self, x):
+        # Split the input back into x and x_surf
+        x, x_surf = torch.split(x, [x.size(1) - self.num_patches_surf, self.num_patches_surf], dim=1)
+
+        # Apply the 3D position embedding to x and the 2D position embedding to x_surf
+        x = self.pos_emb_3d(x)
+        x_surf = self.pos_emb_2d(x_surf)
+
+        # Concatenate x and x_surf along the appropriate dimension
+        x_combined = torch.cat((x, x_surf), dim=1)
+
+        return x_combined

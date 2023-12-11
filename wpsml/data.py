@@ -13,6 +13,7 @@ import glob
 import torch
 import zarr
 from zarr.storage import KVStore
+import netCDF4 as nc
 
 
 def get_forward_data(filename) -> xr.DataArray:
@@ -67,7 +68,7 @@ class CheckForBadData():
                 raise ValueError(f'\n{attr_name} has negative values at {image.time.values}')
         return sample
 
-class Normalize():
+class NormalizeState():
     def __init__(self,mean_file,std_file):
         self.mean_ds = xr.open_dataset(mean_file)
         self.std_ds = xr.open_dataset(std_file)
@@ -81,6 +82,84 @@ class Normalize():
                 #sample[key]=value_change
                 normalized_sample[key] = (value - self.mean_ds) / self.std_ds
         return normalized_sample
+
+
+class NormalizeTendency:
+    def __init__(self, variables, surface_variables, base_path):
+        self.variables = variables
+        self.surface_variables = surface_variables
+        self.base_path = base_path
+
+        # Load the NetCDF files and store the data
+        self.mean = {}
+        self.std = {}
+        for name in self.variables + self.surface_variables:
+            mean_dataset = nc.Dataset(f'{self.base_path}/All_NORMtend_{name}_2010_staged.mean.nc')
+            std_dataset = nc.Dataset(f'{self.base_path}/All_NORMtend_{name}_2010_staged.STD.nc')
+            self.mean[name] = torch.from_numpy(mean_dataset.variables[name][:])
+            self.std[name] = torch.from_numpy(std_dataset.variables[name][:])
+
+    def transform(self, tensor, surface_tensor):
+        device = tensor.device
+
+        # Apply z-score normalization using the pre-loaded mean and std
+        for name in self.variables:
+            mean = self.mean[name].view(1, 1, self.mean[name].size(0), 1, 1).to(device)
+            std = self.std[name].view(1, 1, self.std[name].size(0), 1, 1).to(device)
+            transformed_tensor = (tensor - mean) / std
+
+        for name in self.surface_variables:
+            mean = self.mean[name].view(1, 1, 1, 1).to(device)
+            std = self.std[name].view(1, 1, 1, 1).to(device)
+            transformed_surface_tensor = (surface_tensor - mean) / std
+
+        return transformed_tensor, transformed_surface_tensor
+
+    def inverse_transform(self, tensor, surface_tensor):
+        device = tensor.device
+
+        # Reverse z-score normalization using the pre-loaded mean and std
+        for name in self.variables:
+            mean = self.mean[name].view(1, 1, self.mean[name].size(0), 1, 1).to(device)
+            std = self.std[name].view(1, 1, self.std[name].size(0), 1, 1).to(device)
+            transformed_tensor = tensor * std + mean
+
+        for name in self.surface_variables:
+            mean = self.mean[name].view(1, 1, 1, 1).to(device)
+            std = self.std[name].view(1, 1, 1, 1).to(device)
+            transformed_surface_tensor = surface_tensor * std + mean
+
+        return transformed_tensor, transformed_surface_tensor
+
+
+# class NormalizeTendency:
+#     def __init__(self, variables, surface_variables, base_path):
+#         self.variables = variables
+#         self.surface_variables = surface_variables
+#         self.base_path = base_path
+
+#         # Load the NetCDF files and store the data
+#         self.data = {}
+#         for name in self.variables:
+#             dataset = nc.Dataset(f'{self.base_path}/All_diff_{name}_2010_staged.STD.nc')
+#             self.data[name] = torch.from_numpy(dataset.variables[name][:])
+
+#         for name in self.surface_variables:
+#             dataset = nc.Dataset(f'{self.base_path}/All_diff_{name}_2010_staged.STD.nc')
+#             self.data[name] = torch.from_numpy(dataset.variables[name][:])
+
+#     def __call__(self, tensor, surface_tensor):
+        
+#         device = tensor.device
+
+#         # Multiply the tensors with the pre-loaded data
+#         for name in self.variables:
+#             tensor *= self.data[name].view(1, 1, self.data[name].size(0), 1, 1).to(device)
+
+#         for name in self.surface_variables:
+#             surface_tensor *= self.data[name].view(1, 1, 1, 1).to(device)
+
+#         return tensor, surface_tensor
 
 
 class ToTensor():
