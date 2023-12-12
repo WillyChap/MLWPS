@@ -1,0 +1,7 @@
+Metadata-Version: 2.1
+Name: wpsml
+Version: 0.1
+Summary: Global ML models for predicting interesting stuff
+Author: Will Chapman, John Schreck, David John Gagne
+Author-email: schreck@ucar.edu
+License: MIT

@@ -37,16 +37,16 @@ project_num = 'NAML0001' #what project key dfo you have?
 remove_dask_worker_scripts = True
 
 
-##single level variables {supports: T2m, T[lev],V[lev],U[lev],Q[lev],Z[lev]}: 
-#note! make sure that level exists! We could do a "method=nearest" but I think this
-#leads to less clarity on what you are actually predicting (PS comes standard...).
+# #single level variables {supports: T2m, T[lev],V[lev],U[lev],Q[lev],Z[lev]}: 
+# note! make sure that level exists! We could do a "method=nearest" but I think this
+# leads to less clarity on what you are actually predicting (PS comes standard...).
 
 varin_l = ['VAR_2T','T','V','U','Q','Z'] #what is the ERA variable called? 
 lev_list = [None,500,500,500,500,500] #what level do you want (NONE for surface vars).
 varout_l = ['t2m','T500','V500','U500','Q500','Z500'] #what should the variable be named? 
 #### settings !!! MODIFY THIS BLOCK !!!
 
-#### ++++++ dask NCAR client: 
+# ### ++++++ dask NCAR client: 
 print('...setting up dask client...')
 if 'client' in locals():
     client.shutdown()
@@ -56,7 +56,7 @@ else:
 from distributed import Client
 from dask_jobqueue import PBSCluster
 
-cluster = PBSCluster(project=project_num,walltime='06:00:00',cores=1, memory='70GB',shared_temp_directory='/glade/scratch/wchapman/tmp',queue='casper')
+cluster = PBSCluster(project=project_num,walltime='06:00:00',cores=1, memory='70GB',shared_temp_directory='/glade/derecho/scratch/wchapman/tmp',queue='main')
 cluster.scale(jobs=40)
 client = Client(cluster)
 #### ----- dask NCAR client: 
@@ -359,6 +359,31 @@ def write_to_netcdf(ds, filename):
     print(filename)
     ds.to_netcdf(filename, engine="netcdf4")
 
+def check_file_size(file_path, size_limit):
+    if os.path.exists(file_path):
+        file_size = get_folder_size(file_path)
+        
+        if file_size > size_limit:
+            print(f"The file {file_path} exists and is larger than {size_limit} bytes.")
+            
+            return True 
+        else:
+            print(f"The file {file_path} exists but is not larger than {size_limit} bytes.")
+            print(f"The file size is {file_size} bytes.")
+            return False
+    else:
+        print(f"The file {file_path} does not exist.")
+        return False
+
+    
+def get_folder_size(folder_path):
+    total_size = 0
+    for dirpath, dirnames, filenames in os.walk(folder_path):
+        for filename in filenames:
+            filepath = os.path.join(dirpath, filename)
+            total_size += os.path.getsize(filepath)
+    return total_size    
+
 def find_strings_by_pattern(string_list, pattern):
     """
     Find strings in a list that match a specified pattern.
@@ -513,6 +538,8 @@ if __name__ == '__main__':
     # Extract start_date and end_date from the arguments
     start_date = args.start_date
     end_date = args.end_date
+    end_date_minus1= subtract_one_day(end_date)
+
     # ... (rest of your script)
     print(f'Start date: {start_date}')
     print(f'End date: {end_date}')
@@ -523,116 +550,167 @@ if __name__ == '__main__':
     ##look at all the dates:
     #log for the files that are created.
     all_files=[]
-    print(len(Dayswantedtot))
-    if len(Dayswantedtot)<4:
-        start_time = time.time()  # Record the start time
-        Dayswanted = pd.date_range(start=start_date,end=end_date,freq=str(interval_hours)+'D')
-        Dateswanted = pd.date_range(start=start_date,end=end_date,freq=str(interval_hours)+'H')
-        Static_zheight = xr.open_dataset('/glade/u/home/wchapman/RegriddERA5_CAMFV/static_operation_ERA5_zhght.nc')
-        files_dict=fp_dates_wanted(Dateswanted)
-        #make the files:
-        print('...starting processing...')
-        delayed_writes = make_nc_files_optimized(files_dict, Dateswanted, Dayswanted,FPout, prefix_out)
-        elapsed_time = time.time() - start_time
-        print(f" executed in {elapsed_time} seconds")
-    else: 
-        print('in here!!')
-        divided_lists =divide_datetime_index(Dayswantedtot)
-        print('divided lists')
-        
-        t2m_list = [] #WEC
-        z_list = [] #WEC
-        ub_list = [] #WEC
-        vb_list = [] #WEC
-        tb_list = [] #WEC
-        qb_list = [] #WEC
-        
-        for dd in divided_lists:
-            print('here we go')
-            strtd = str(dd[0])[:10]
-            endd  = str(dd[-1])[:10]
-            endd  = increment_date_by_one_day(endd)
-            print('doing files:',strtd,endd)
+    AFout = f"{FPout}/AllFiles_{start_date}_{end_date_minus1}_staged.zarr"
+    size_limit = 800 * 1024 * 1024 * 1024  # 800GB in bytes
+    print('checking folder size')
+    if not check_file_size(AFout,size_limit):
+        print(len(Dayswantedtot))
+        if len(Dayswantedtot)<4:
             start_time = time.time()  # Record the start time
-            Dayswanted = pd.date_range(start=strtd,end=endd,freq=str(interval_hours)+'D')
-            Dateswanted = pd.date_range(start=strtd,end=endd,freq=str(interval_hours)+'H')
+            Dayswanted = pd.date_range(start=start_date,end=end_date,freq=str(interval_hours)+'D')
+            Dateswanted = pd.date_range(start=start_date,end=end_date,freq=str(interval_hours)+'H')
             Static_zheight = xr.open_dataset('/glade/u/home/wchapman/RegriddERA5_CAMFV/static_operation_ERA5_zhght.nc')
             files_dict=fp_dates_wanted(Dateswanted)
             #make the files:
             print('...starting processing...')
-            delayed_writes,created_files = make_nc_files_optimized(files_dict, Dateswanted, Dayswanted,FPout, prefix_out)
-            all_files.append(created_files)
+            delayed_writes = make_nc_files_optimized(files_dict, Dateswanted, Dayswanted,FPout, prefix_out)
             elapsed_time = time.time() - start_time
-            print(f" phase executed in {elapsed_time} seconds")
-            t2m_list.append(files_dict['t2m']) #WEC
-            z_list.append(files_dict['z']) #WEC
-            ub_list.append(files_dict['ub']) #WEC
-            vb_list.append(files_dict['vb']) #WEC
-            tb_list.append(files_dict['tb']) #WEC
-            qb_list.append(files_dict['qb']) #WEC
-            
-            
-    all_files = flatten_list(all_files)
-    all_files.pop()
-    print('...creating monthly files...')
-    print('these are all the files we created together: ', all_files) 
+            print(f" executed in {elapsed_time} seconds")
+        else: 
+            print('in here!!')
+            divided_lists =divide_datetime_index(Dayswantedtot)
+            print('divided lists')
+
+            t2m_list = [] #WEC
+            z_list = [] #WEC
+            ub_list = [] #WEC
+            vb_list = [] #WEC
+            tb_list = [] #WEC
+            qb_list = [] #WEC
+
+            for dd in divided_lists:
+                print('here we go')
+                strtd = str(dd[0])[:10]
+                endd  = str(dd[-1])[:10]
+                endd  = increment_date_by_one_day(endd)
+                print('doing files:',strtd,endd)
+                start_time = time.time()  # Record the start time
+                Dayswanted = pd.date_range(start=strtd,end=endd,freq=str(interval_hours)+'D')
+                Dateswanted = pd.date_range(start=strtd,end=endd,freq=str(interval_hours)+'H')
+                Static_zheight = xr.open_dataset('/glade/u/home/wchapman/RegriddERA5_CAMFV/static_operation_ERA5_zhght.nc')
+                files_dict=fp_dates_wanted(Dateswanted)
+                #make the files:
+                print('...starting processing...')
+                delayed_writes,created_files = make_nc_files_optimized(files_dict, Dateswanted, Dayswanted,FPout, prefix_out)
+                all_files.append(created_files)
+                elapsed_time = time.time() - start_time
+                print(f" phase executed in {elapsed_time} seconds")
+                t2m_list.append(files_dict['t2m']) #WEC
+                z_list.append(files_dict['z']) #WEC
+                ub_list.append(files_dict['ub']) #WEC
+                vb_list.append(files_dict['vb']) #WEC
+                tb_list.append(files_dict['tb']) #WEC
+                qb_list.append(files_dict['qb']) #WEC
+
+        all_files = flatten_list(all_files)
+        all_files.pop()
+        print('...creating monthly files...')
+        print('these are all the files we created together: ', all_files) 
+
+        delayed_writes = []
+        for yryr in np.arange(1979,2100):
+            yryrstr = str(np.char.zfill(str(yryr),4))
+            for momo in np.arange(1,13):
+                start_time = time.time()  # Record the start time
+                momostr = str(np.char.zfill(str(momo),2))
+                # Get a list of file paths
+                pattern = yryrstr+momostr
+                matching_strings = find_strings_by_pattern(all_files, pattern)
+
+                if len(matching_strings)==0:
+                    continue
+                else: 
+                    print('matched on:',pattern)
+                    print(matching_strings)
+
+                outtot = FPout+'ERA5_compiled.'+yryrstr+momostr+'.nc'
+
+                if os.path.exists(outtot):
+                    sizefile = os.path.getsize(outtot)
+                    if sizefile>0: #!!!! set some threshold here!!!!
+                        print('file ', outtot, ' already in memory')
+                        continue 
+
+                DSall = xr.open_mfdataset(matching_strings,parallel=True)
+                print('loaded')
+
+                #delayed_write_uvtq = delayed(DSall.squeeze().to_netcdf)(outtot)
+                delayed_write_uvtq = delayed(write_to_netcdf)(DSall.squeeze(),outtot)
+                #delayed_writes.append(delayed_write_uvtq)
+                elapsed_time = time.time() - start_time
+                print(f" phase executed in {elapsed_time} seconds")
+
+
+        print('...writing monthly files...')
+        with ProgressBar():
+            delayed_writes = list(dask.compute(*delayed_writes))
+
+        print('zarr-ifying the files:')
+        files_ = find_staged_files(start_date,end_date)
+        DS = xr.open_mfdataset(files_,parallel=True)
+
+
+        ##Add Surface and UL variables.... 
+        #in this block.
+        #/glade/campaign/collections/rda/data/ds633.0/
+        ##
+        print('opened')
+        DS = DS.chunk({'time':10})
+        print('chunked')
+        print('send to zarr')
+        yrz = start_date[:4]
+        DS.sel(time=slice(start_date,end_date_minus1)).to_zarr(AFout)
+        print('...finished...')
     
-    delayed_writes = []
-    for yryr in np.arange(1979,2100):
-        yryrstr = str(np.char.zfill(str(yryr),4))
-        for momo in np.arange(1,13):
+    else: 
+        print(len(Dayswantedtot))
+        if len(Dayswantedtot)<4:
             start_time = time.time()  # Record the start time
-            momostr = str(np.char.zfill(str(momo),2))
-            # Get a list of file paths
-            pattern = yryrstr+momostr
-            matching_strings = find_strings_by_pattern(all_files, pattern)
-            
-            if len(matching_strings)==0:
-                continue
-            else: 
-                print('matched on:',pattern)
-                print(matching_strings)
-            
-            outtot = FPout+'ERA5_compiled.'+yryrstr+momostr+'.nc'
-            
-            if os.path.exists(outtot):
-                sizefile = os.path.getsize(outtot)
-                if sizefile>0: #!!!! set some threshold here!!!!
-                    print('file ', outtot, ' already in memory')
-                    continue 
-            
-            DSall = xr.open_mfdataset(matching_strings,parallel=True)
-            print('loaded')
-            
-            #delayed_write_uvtq = delayed(DSall.squeeze().to_netcdf)(outtot)
-            delayed_write_uvtq = delayed(write_to_netcdf)(DSall.squeeze(),outtot)
-            #delayed_writes.append(delayed_write_uvtq)
+            Dayswanted = pd.date_range(start=start_date,end=end_date,freq=str(interval_hours)+'D')
+            Dateswanted = pd.date_range(start=start_date,end=end_date,freq=str(interval_hours)+'H')
+            Static_zheight = xr.open_dataset('/glade/u/home/wchapman/RegriddERA5_CAMFV/static_operation_ERA5_zhght.nc')
+            files_dict=fp_dates_wanted(Dateswanted)
+            #make the files:
+            print('...starting processing...')
+            #delayed_writes = make_nc_files_optimized(files_dict, Dateswanted, Dayswanted,FPout, prefix_out)
             elapsed_time = time.time() - start_time
-            print(f" phase executed in {elapsed_time} seconds")
-            
-            
-    print('...writing monthly files...')
-    with ProgressBar():
-        delayed_writes = list(dask.compute(*delayed_writes))
-   
-    print('zarr-ifying the files:')
-    files_ = find_staged_files(start_date,end_date)
-    DS = xr.open_mfdataset(files_,parallel=True)
-    
-    
-    ##Add Surface and UL variables.... 
-    #in this block.
-    #/glade/campaign/collections/rda/data/ds633.0/
-    ##
-    end_date_minus1= subtract_one_day(end_date)
-    print('opened')
-    DS = DS.chunk({'time':10})
-    print('chunked')
-    print('send to zarr')
-    yrz = start_date[:4]
-    DS.sel(time=slice(start_date,end_date_minus1)).to_zarr(f"{FPout}/AllFiles_{start_date}_{end_date_minus1}_staged.zarr")
-    print('...finished...')
-         
+            print(f" executed in {elapsed_time} seconds")
+        else: 
+            print('in here!!')
+            divided_lists =divide_datetime_index(Dayswantedtot)
+            print('divided lists')
+
+            t2m_list = [] #WEC
+            z_list = [] #WEC
+            ub_list = [] #WEC
+            vb_list = [] #WEC
+            tb_list = [] #WEC
+            qb_list = [] #WEC
+
+            for dd in divided_lists:
+                print('here we go')
+                strtd = str(dd[0])[:10]
+                endd  = str(dd[-1])[:10]
+                endd  = increment_date_by_one_day(endd)
+                print('doing files:',strtd,endd)
+                start_time = time.time()  # Record the start time
+                Dayswanted = pd.date_range(start=strtd,end=endd,freq=str(interval_hours)+'D')
+                Dateswanted = pd.date_range(start=strtd,end=endd,freq=str(interval_hours)+'H')
+                Static_zheight = xr.open_dataset('/glade/u/home/wchapman/RegriddERA5_CAMFV/static_operation_ERA5_zhght.nc')
+                files_dict=fp_dates_wanted(Dateswanted)
+                #make the files:
+                print('...starting processing...')
+                #delayed_writes,created_files = make_nc_files_optimized(files_dict, Dateswanted, Dayswanted,FPout, prefix_out)
+                #all_files.append(created_files)
+                elapsed_time = time.time() - start_time
+                print(f" phase executed in {elapsed_time} seconds")
+                t2m_list.append(files_dict['t2m']) #WEC
+                z_list.append(files_dict['z']) #WEC
+                ub_list.append(files_dict['ub']) #WEC
+                vb_list.append(files_dict['vb']) #WEC
+                tb_list.append(files_dict['tb']) #WEC
+                qb_list.append(files_dict['qb']) #WEC
+
         
     ################## regridding + saving series: #WEC
     t2m_list = flatten_list(t2m_list)#WEC

@@ -1,0 +1,12 @@
+README.md
+setup.py
+wpsml/__init__.py
+wpsml/data.py
+wpsml/loss.py
+wpsml/model.py
+wpsml/pe.py
+wpsml/visual_ssl.py
+wpsml.egg-info/PKG-INFO
+wpsml.egg-info/SOURCES.txt
+wpsml.egg-info/dependency_links.txt
+wpsml.egg-info/top_level.txt
