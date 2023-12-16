@@ -132,80 +132,6 @@ class NormalizeTendency:
         return transformed_tensor, transformed_surface_tensor
 
 
-# class NormalizeTendency:
-#     def __init__(self, variables, surface_variables, base_path):
-#         self.variables = variables
-#         self.surface_variables = surface_variables
-#         self.base_path = base_path
-
-#         # Load the NetCDF files and store the data
-#         self.data = {}
-#         for name in self.variables:
-#             dataset = nc.Dataset(f'{self.base_path}/All_diff_{name}_2010_staged.STD.nc')
-#             self.data[name] = torch.from_numpy(dataset.variables[name][:])
-
-#         for name in self.surface_variables:
-#             dataset = nc.Dataset(f'{self.base_path}/All_diff_{name}_2010_staged.STD.nc')
-#             self.data[name] = torch.from_numpy(dataset.variables[name][:])
-
-#     def __call__(self, tensor, surface_tensor):
-        
-#         device = tensor.device
-
-#         # Multiply the tensors with the pre-loaded data
-#         for name in self.variables:
-#             tensor *= self.data[name].view(1, 1, self.data[name].size(0), 1, 1).to(device)
-
-#         for name in self.surface_variables:
-#             surface_tensor *= self.data[name].view(1, 1, 1, 1).to(device)
-
-#         return tensor, surface_tensor
-
-
-class ToTensor():
-    def __init__(self):
-        
-        self.allvarsdo = ['U','V','T','Q','SP','t2m','V500','U500','T500','Z500','Q500']
-        self.surfvars = ['SP', 't2m','V500','U500','T500','Z500','Q500']
-        
-    def __call__(self, sample: Sample) -> Sample:
-    
-        return_dict = {}
-        
-        for key, value in sample.items():
-            
-            if isinstance(value, xr.DataArray):
-                value_var = value.values
-                
-            elif isinstance(value, xr.Dataset):
-                surface_vars = []
-                concatenated_vars = []
-                for vv in self.allvarsdo: 
-                    value_var = value[vv].values
-                    if vv in self.surfvars:
-                        surface_vars_temp = value_var
-                        surface_vars.append(surface_vars_temp)
-                    else:
-                        concatenated_vars.append(value_var)
-                    
-            else: 
-                value_var = value        
-                    
-            if key == 'historical_ERA5_images':
-                return_dict['x_surf'] = torch.as_tensor(surface_vars).squeeze()
-                return_dict['x'] = torch.as_tensor(np.vstack(concatenated_vars))
-            elif key == 'target_ERA5_images':
-                y_surf = torch.as_tensor(surface_vars)
-                #print(y_surf)
-                y = torch.as_tensor(np.hstack([np.expand_dims(x, axis=1) for x in concatenated_vars]))
-                return_dict['y1_surf'] = y_surf[:,0]
-                return_dict['y2_surf'] = y_surf[:,1]
-                return_dict['y1'] = y[0]
-                return_dict['y2'] = y[1]
-                
-        return return_dict
-
-
 class Segment(NamedTuple):
     """Represents the start and end indicies of a segment of contiguous samples."""
     start: int
@@ -381,6 +307,129 @@ def find_key_for_number(input_number, data_dict):
     # Return None if the number is not within any range
     return None
 
+class ToTensorDeprecated():
+    def __init__(self,history_len=int(1),forecast_len=int(2)):
+        
+        self.hist_len = history_len
+        self.for_len = forecast_len
+        self.allvarsdo = ['U','V','T','Q','SP','t2m','V500','U500','T500','Z500','Q500']
+        self.surfvars = ['SP', 't2m','V500','U500','T500','Z500','Q500']
+        
+    def __call__(self, sample: Sample) -> Sample:
+    
+        return_dict = {}
+        if (self.hist_len==1) & (self.for_len ==2):
+            for key, value in sample.items():
+
+                if isinstance(value, xr.DataArray):
+                    value_var = value.values
+
+                elif isinstance(value, xr.Dataset):
+                    surface_vars = []
+                    concatenated_vars = []
+                    for vv in self.allvarsdo: 
+                        value_var = value[vv].values
+                        if vv in self.surfvars:
+                            surface_vars_temp = value_var
+                            surface_vars.append(surface_vars_temp)
+                        else:
+                            concatenated_vars.append(value_var)
+
+                else: 
+                    value_var = value        
+
+                if key == 'historical_ERA5_images':
+                    return_dict['x_surf'] = torch.as_tensor(surface_vars).squeeze()
+                    return_dict['x'] = torch.as_tensor(np.vstack(concatenated_vars))
+                elif key == 'target_ERA5_images':
+                    y_surf = torch.as_tensor(surface_vars)
+                    #print(y_surf)
+                    y = torch.as_tensor(np.hstack([np.expand_dims(x, axis=1) for x in concatenated_vars]))
+                    return_dict['y1_surf'] = y_surf[:,0]
+                    return_dict['y2_surf'] = y_surf[:,1]
+                    return_dict['y1'] = y[0]
+                    return_dict['y2'] = y[1]
+                    
+        else:
+            for key, value in sample.items():
+
+                if isinstance(value, xr.DataArray):
+                    value_var = value.values
+
+                elif isinstance(value, xr.Dataset):
+                    surface_vars = []
+                    concatenated_vars = []
+                    for vv in self.allvarsdo: 
+                        value_var = value[vv].values
+                        if vv in self.surfvars:
+                            surface_vars_temp = value_var
+                            surface_vars.append(surface_vars_temp)
+                        else:
+                            concatenated_vars.append(value_var)
+
+                else: 
+                    value_var = value        
+
+                if key == 'historical_ERA5_images':
+                    return_dict['x_surf'] = torch.as_tensor(surface_vars).squeeze()
+                    return_dict['x'] = torch.as_tensor(np.hstack([np.expand_dims(x, axis=1) for x in concatenated_vars]))
+                elif key == 'target_ERA5_images':
+                    y_surf = torch.as_tensor(surface_vars)
+                    #print(y_surf)
+                    y = torch.as_tensor(np.hstack([np.expand_dims(x, axis=1) for x in concatenated_vars]))
+                    # y = torch.as_tensor(np.vstack(concatenated_vars))
+                    return_dict['y_surf'] = y_surf
+                    return_dict['y'] = y
+                    
+                
+        return return_dict 
+    
+
+class ToTensor:
+    def __init__(self, history_len=1, forecast_len=2):
+        
+        self.hist_len = int(history_len)
+        self.for_len = int(forecast_len)
+        self.allvarsdo = ['U','V','T','Q','SP','t2m','V500','U500','T500','Z500','Q500']
+        self.surfvars = ['SP', 't2m','V500','U500','T500','Z500','Q500']
+        
+    def __call__(self, sample: Sample) -> Sample:
+    
+        return_dict = {}
+
+        for key, value in sample.items():
+
+            if isinstance(value, xr.DataArray):
+                value_var = value.values
+
+            elif isinstance(value, xr.Dataset):
+                surface_vars = []
+                concatenated_vars = []
+                for vv in self.allvarsdo: 
+                    value_var = value[vv].values
+                    if vv in self.surfvars:
+                        surface_vars_temp = value_var
+                        surface_vars.append(surface_vars_temp)
+                    else:
+                        concatenated_vars.append(value_var)
+
+            else: 
+                value_var = value        
+
+            if key == 'historical_ERA5_images':
+                x_surf = torch.as_tensor(surface_vars).squeeze()
+                return_dict['x_surf'] = x_surf.permute(1, 0, 2, 3) if len(x_surf.shape) == 4 else x_surf.unsqueeze(0)
+                return_dict['x'] = torch.as_tensor(np.hstack([np.expand_dims(x, axis=1) for x in concatenated_vars]))
+
+            elif key == 'target_ERA5_images':
+                y_surf = torch.as_tensor(surface_vars)
+                y = torch.as_tensor(np.hstack([np.expand_dims(x, axis=1) for x in concatenated_vars]))
+                return_dict['y_surf'] = y_surf.permute(1, 0, 2, 3)
+                return_dict['y'] = y
+                
+        return return_dict 
+    
+
 class ERA5Dataset(torch.utils.data.Dataset):
     
     def __init__(
@@ -390,16 +439,19 @@ class ERA5Dataset(torch.utils.data.Dataset):
         forecast_len: int = 2,
         transform: Optional[Callable] = None,
         SEED=42,
+        skip_periods=None,
     ):
         self.history_len = history_len
         self.forecast_len = forecast_len
         self.transform = transform
+        self.skip_periods = skip_periods
         self.total_seq_len = self.history_len + self.forecast_len
         all_fils = []
         filenames = sorted(filenames)
         for fn in filenames:
             all_fils.append(get_forward_data(filename=fn))
         self.all_fils = all_fils
+        self.data_array = all_fils[0]
         self.rng = np.random.default_rng(seed=SEED)
         
         #set data places: 
@@ -430,19 +482,26 @@ class ERA5Dataset(torch.utils.data.Dataset):
         #find the result key:
         result_key = find_key_for_number(index, self.meta_data_dict)
         #get the data selection:
-        true_ind = index-self.meta_data_dict[result_key][1]
+        true_ind = index-self.meta_data_dict[result_key][1] 
         
-        if true_ind > (len(self.all_fils[int(result_key)]['time'])-(self.forecast_len+1)):
-            true_ind = len(self.all_fils[int(result_key)]['time'])-(self.forecast_len+1)
+        if true_ind > (len(self.all_fils[int(result_key)]['time'])-(self.history_len+self.forecast_len+1)):
+            true_ind = len(self.all_fils[int(result_key)]['time'])-(self.history_len+self.forecast_len+1)
+       
+        datasel = self.all_fils[int(result_key)].isel(time=slice(true_ind, true_ind+self.history_len+self.forecast_len+1)).load()       
         
-        datasel = self.all_fils[int(result_key)].isel(time=slice(true_ind, true_ind+self.forecast_len+1)).load()
-        
-        sample = Sample(
-            historical_ERA5_images=datasel.isel(time=slice(0, self.history_len)),
-            target_ERA5_images=datasel.isel(time=slice(self.history_len, len(datasel['time']))),
-            datetime_index=datasel.time.values.astype('datetime64[s]').astype(int)
-        )
-    
+        if self.skip_periods is not None:
+            sample = Sample(
+                historical_ERA5_images=datasel.isel(time=slice(0, self.history_len, self.skip_periods)),
+                target_ERA5_images=datasel.isel(time=slice(self.history_len, len(datasel['time']), self.skip_periods)),
+                datetime_index=datasel.time.values.astype('datetime64[s]').astype(int)
+            )
+        else:
+            sample = Sample(
+                historical_ERA5_images=datasel.isel(time=slice(0, self.history_len)),
+                target_ERA5_images=datasel.isel(time=slice(self.history_len, len(datasel['time']))),
+                datetime_index=datasel.time.values.astype('datetime64[s]').astype(int)
+            )
+
         if self.transform:
             sample = self.transform(sample)
         return sample
