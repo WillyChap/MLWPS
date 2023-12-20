@@ -49,6 +49,7 @@ from torch.distributed.fsdp import StateDictType, FullStateDictConfig, ShardedSt
 
 from torchvision import transforms
 from wpsml.vit2d import ViT2D
+from wpsml.loss import latititude_weights, variable_weights, TotalLoss2D
 from wpsml.data import ERA5Dataset, ToTensor, NormalizeState, NormalizeTendency
 from wpsml.scheduler import phased_lr_lambda, lr_lambda_phase1
 import joblib
@@ -152,9 +153,8 @@ def trainer(rank, world_size, conf, trial=False):
     apply_grad_penalty = conf['trainer']['apply_grad_penalty']
     thread_workers = conf['trainer']['thread_workers']
     stopping_patience = conf['trainer']['stopping_patience']
-    
     # Define teacher forcing ratio
-    teacher_forcing_ratio = 0.0
+    teacher_forcing_ratio = conf['trainer']['teacher_forcing_ratio']
 
     # Model conf settings 
     
@@ -166,11 +166,11 @@ def trainer(rank, world_size, conf, trial=False):
     frame_patch_size = conf['model']['frame_patch_size']
     
     dim = conf['model']['dim']
-    layers = conf['model']['layers']
     dim_head = conf['model']['dim_head']
     mlp_dim = conf['model']['mlp_dim']
     heads = conf['model']['heads']
     depth = conf['model']['depth']
+    dropout = conf['model']['dropout']
 
     rk4_integration = conf['model']['rk4_integration']
     num_register_tokens = conf['model']['num_register_tokens'] if 'num_register_tokens' in conf['model'] else 0
@@ -181,44 +181,15 @@ def trainer(rank, world_size, conf, trial=False):
     vq_codebook_size = conf['model']['vq_codebook_size'] if 'vq_codebook_size' in conf['model'] else 128
     vq_decay = conf['model']['vq_decay'] if 'vq_decay' in conf['model'] else 0.1
     vq_commitment_weight = conf['model']['vq_commitment_weight'] if 'vq_commitment_weight' in conf['model'] else 1.0
+    vq_kmeans_init = conf['model']['vq_kmeans_init']
+    vq_use_cosine_sim = conf['model']['vq_use_cosine_sim']
     
-    use_vgg = conf['model']['use_vgg'] if 'use_vgg' in conf['model'] else False
-    
-    use_visual_ssl = conf['model']['use_visual_ssl'] if 'use_visual_ssl' in conf['model'] else False
-    visual_ssl_weight = conf['model']['visual_ssl_weight'] if 'visual_ssl_weight' in conf['model'] else 0.05
-    
-    use_spectral_loss = conf['model']['use_spectral_loss']
-    spectral_wavenum_init = conf['model']['spectral_wavenum_init'] if 'spectral_wavenum_init' in conf['model'] else 20
-    spectral_lambda_reg = conf['model']['spectral_lambda_reg'] if 'spectral_lambda_reg' in conf['model'] else 1.0
-    
-    l2_recon_loss = conf['model']['l2_recon_loss'] if 'l2_recon_loss' in conf['model'] else False
-    use_hinge_loss = conf['model']['use_hinge_loss'] if 'use_hinge_loss' in conf['model'] else True
-
     # Data vars
     channels = len(conf["data"]["variables"])
     surface_channels = len(conf["data"]["surface_variables"])
     history_len = conf["data"]["history_len"]
     forecast_len = conf["data"]["forecast_len"]
     time_step = conf["data"]["time_step"]
-    
-    # Load weights for U, V, T, Q
-    weights_UVTQ = torch.tensor([
-        conf["weights"]["U"],
-        conf["weights"]["V"],
-        conf["weights"]["T"],
-        conf["weights"]["Q"]
-    ]).view(1, channels, frames, 1, 1)
-
-    # Load weights for SP, t2m, V500, U500, T500, Z500, Q500
-    weights_sfc = torch.tensor([
-        conf["weights"]["SP"],
-        conf["weights"]["t2m"],
-        conf["weights"]["V500"],
-        conf["weights"]["U500"],
-        conf["weights"]["T500"],
-        conf["weights"]["Z500"],
-        conf["weights"]["Q500"]
-    ]).view(1, surface_channels, 1, 1)
      
     # datasets (zarr reader) 
     all_ERA_files = sorted(glob.glob(conf["data"]["save_loc"]))
@@ -257,14 +228,7 @@ def trainer(rank, world_size, conf, trial=False):
             ToTensor(history_len=history_len, forecast_len=forecast_len),
         ]),
     )
-    
-    # Initialize scaler for predicted tendencies
-    tendency_scaler = NormalizeTendency(
-        conf["data"]["variables"],
-        conf["data"]["surface_variables"],
-        '/glade/campaign/cisl/aiml/wchapman/MLWPS/STAGING/'
-    )
-    
+
     # setup the distributed sampler
     
     sampler_tr = DistributedSampler(train_dataset,
@@ -319,6 +283,7 @@ def trainer(rank, world_size, conf, trial=False):
         heads=heads,
         dim_head=dim_head,
         mlp_dim=mlp_dim,
+        dropout=dropout,
         num_register_tokens=num_register_tokens,
         use_registers=use_registers,
         token_dropout=token_dropout,
@@ -326,8 +291,10 @@ def trainer(rank, world_size, conf, trial=False):
         vq_codebook_size=vq_codebook_size,
         vq_decay=vq_decay,
         vq_commitment_weight=vq_commitment_weight,
+        vq_kmeans_init=vq_kmeans_init,
+        vq_use_cosine_sim=vq_use_cosine_sim
     )
-
+    
     num_params = sum(p.numel() for p in vae.parameters())
     if rank == 0:
         logging.info(f"Number of parameters in the model: {num_params}")
@@ -382,7 +349,9 @@ def trainer(rank, world_size, conf, trial=False):
     # load optimizer and grad scaler states
     if start_epoch > 0:
 
-        checkpoint = torch.load(f"{save_loc}/checkpoint.pt", map_location=device)
+        
+        ckpt = f"{save_loc}/checkpoint.pt" if conf["trainer"]["mode"] != "ddp" else f"{save_loc}/checkpoint_{device}.pt"
+        checkpoint = torch.load(ckpt, map_location=device)
         
         if conf["trainer"]["mode"] == "fsdp":
             logging.info(f"Loading FSDP model, optimizer, grad scaler, and learning rate scheduler states from {save_loc}")
@@ -451,8 +420,14 @@ def trainer(rank, world_size, conf, trial=False):
                 continue
             results_dict[key] = list(saved_results[key])
         
-    # Train 
+ 
     for epoch in range(start_epoch, epochs):
+        
+        ############
+        #
+        # Train
+        #
+        ############
 
         train_loss = []
         
@@ -481,7 +456,7 @@ def trainer(rank, world_size, conf, trial=False):
             for _ in range(grad_accum_every):
                 
                 batch = next(dl)
-                loss_fn = torch.nn.MSELoss()
+                loss_fn = TotalLoss2D(conf) #torch.nn.MSELoss(reduction='none')
                 
                 # Initialize x and x_surf with the first time step
                 x_atmo = batch["x"][:, 0]
@@ -492,6 +467,7 @@ def trainer(rank, world_size, conf, trial=False):
                 with autocast(enabled=amp):
                     
                     loss = 0.0
+                    commit_loss = 0.0
                     if batch["x"].shape[1] > 1: # multi-step training
                         for i in range(batch["x"].shape[1]-1):
                             y_atmo = batch["y"][:, i]
@@ -499,7 +475,11 @@ def trainer(rank, world_size, conf, trial=False):
                             y = vae.concat_and_reshape(y_atmo, y_surf).to(device)
 
                             # The model's output y1_pred becomes the new x for the next time step
-                            y_pred = model(x)
+                            if model.use_codebook:
+                                y_pred, cm_loss = model(x)
+                                commit_loss += cm_loss
+                            else:
+                                y_pred = model(x)
 
                             # Teacher forcing - use true x input with probability p
                             if torch.rand(1).item() < teacher_forcing_ratio:
@@ -515,8 +495,15 @@ def trainer(rank, world_size, conf, trial=False):
                         y_surf = batch["y_surf"][:, 0]
                         y = vae.concat_and_reshape(y_atmo, y_surf).to(device)
                         
-                        y_pred = model(x)
+                        if model.use_codebook:
+                            y_pred, cm_loss = model(x)
+                            commit_loss += cm_loss
+                        else:
+                            y_pred = model(x)
+                            
                         loss += loss_fn(y, y_pred)
+                        
+                    loss = loss.mean() + commit_loss
                     
                     scaler.scale(loss / grad_accum_every / history_len).backward()
 
@@ -551,6 +538,12 @@ def trainer(rank, world_size, conf, trial=False):
 
         # Shutdown the progbar
         batch_group_generator.close()
+        
+        ############
+        #
+        # Checkpoint
+        #
+        ############
                 
         if (not trial) and conf["trainer"]["mode"] != "fsdp": # rank == 0 and
                 
@@ -632,7 +625,7 @@ def trainer(rank, world_size, conf, trial=False):
             for k in batch_group_generator:
                 
                 batch = next(valid_dl)
-                loss_fn = torch.nn.L1Loss()
+                loss_fn = TotalLoss2D(conf, validation=True)
 
                 # Initialize x and x_surf with the first time step
                 x_atmo = batch["x"][:, 0]
@@ -646,7 +639,10 @@ def trainer(rank, world_size, conf, trial=False):
                         y_surf = batch["y_surf"][:, i]
                         y = vae.concat_and_reshape(y_atmo, y_surf).to(device)
                         # The model's output y1_pred becomes the new x for the next time step
-                        y_pred = model(x)
+                        if model.use_codebook:
+                            y_pred, cm_loss = model(x)
+                        else:
+                            y_pred = model(x)
                         x = y_pred.detach()
                         loss += loss_fn(y, y_pred)
                 else: # single-step
@@ -654,8 +650,15 @@ def trainer(rank, world_size, conf, trial=False):
                     y_surf = batch["y_surf"][:, 0]
                     y = vae.concat_and_reshape(y_atmo, y_surf).to(device)  
                     
-                    y_pred = model(x)
+                    if model.use_codebook:
+                        y_pred, cm_loss = model(x)
+                        commit_loss += cm_loss
+                    else:
+                        y_pred = model(x)
+                        
                     loss += loss_fn(y, y_pred)
+                    
+                loss = loss.mean()
                 
                 batch_loss = torch.Tensor([loss.item() / history_len]).cuda(device)
                 if distributed:

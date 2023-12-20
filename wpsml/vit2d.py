@@ -5,7 +5,7 @@ from einops import rearrange, repeat, pack, unpack
 from einops.layers.torch import Rearrange
 
 import torch.nn.functional as F
-from wpsml.pe import SurfacePosEmb2D
+from wpsml.pe import SurfacePosEmb2D, TokenizationAggregation
 #from wpsml.visual_ssl import SimSiam, MLP
 from vector_quantize_pytorch import VectorQuantize
 
@@ -127,13 +127,16 @@ class ViT2D(nn.Module):
         heads = 8,
         dim_head = 32,
         mlp_dim = 32, 
+        dropout = 0.0,
         use_registers = False,
         num_register_tokens = 0,
         token_dropout = 0.0,
         use_codebook = False,
         vq_codebook_size = 128,
         vq_decay = 0.1,
-        vq_commitment_weight = 1.0
+        vq_commitment_weight = 1.0,
+        vq_kmeans_init = True,
+        vq_use_cosine_sim = True
     ):
                  
         super().__init__()
@@ -149,18 +152,19 @@ class ViT2D(nn.Module):
             depth = depth,
             dim_head = dim_head,
             heads = heads,
-            mlp_dim = mlp_dim
+            mlp_dim = mlp_dim,
+            dropout = dropout
         )
         self.transformer_decoder = Transformer(
             dim = dim,
             depth = depth,
             dim_head = dim_head,
             heads = heads,
-            mlp_dim = mlp_dim
+            mlp_dim = mlp_dim,
+            dropout = dropout
         )
                 
         # Input/output dimensions
-        #num_patches = (image_height // patch_height) * (image_width // patch_width)
         input_dim = (channels * frames + surface_channels) * patch_height * patch_width
         
         # Encoder layers
@@ -183,10 +187,14 @@ class ViT2D(nn.Module):
                                                    p2=patch_width)
         
         # Positional embeddings
-        self.pos_embedding = SurfacePosEmb2D(
+        # self.pos_embedding_enc = TokenizationAggregation(channels, patch_height, patch_width, dim)
+        self.pos_embedding_enc = SurfacePosEmb2D(
             image_height, image_width, patch_height, patch_width, dim
-        )
-
+        ) 
+        self.pos_embedding_dec = SurfacePosEmb2D(
+            image_height, image_width, patch_height, patch_width, dim
+        ) 
+        
         # Token / patch drop
         self.token_dropout = PatchDropout(token_dropout) if token_dropout > 0.0 else nn.Identity()
 
@@ -202,17 +210,18 @@ class ViT2D(nn.Module):
                 dim = dim,
                 codebook_size = vq_codebook_size,     # codebook size
                 decay = vq_decay,             # the exponential moving average decay, lower means the dictionary will change faster
-                commitment_weight = vq_commitment_weight  # the weight on the commitment loss
+                commitment_weight = vq_commitment_weight, # the weight on the commitment loss
+                vq_kmeans_init = vq_kmeans_init,
+                vq_use_cosine_sim = vq_use_cosine_sim
+                
             )
                                                    
-    def encode(self, x):
-        # pack
-        #x = self.concat_and_reshape(x, x_surf)        
+    def encode(self, x):      
         # encode
         x = self.encoder_embed(x)
         x = self.encoder_linear(x)
         x = self.encoder_layer_norm(x)
-        x = self.pos_embedding(x)
+        x = self.pos_embedding_enc(x)
         x = self.token_dropout(x)
         if self.use_registers:
             r = repeat(self.register_tokens, 'n d -> b n d', b = x.shape[0])
@@ -224,7 +233,7 @@ class ViT2D(nn.Module):
         return x
     
     def decode(self, x):
-        x = self.pos_embedding(x)
+        x = self.pos_embedding_dec(x)
         if self.use_registers:
             r = repeat(self.register_tokens, 'n d -> b n d', b = x.shape[0])
             x, ps = pack([x, r], 'b * d')
@@ -238,16 +247,15 @@ class ViT2D(nn.Module):
         x = self.decoder_linear_2(x)
         x = self.decoder_layer_norm_2(x)
         x = self.decoder_rearrange(x)
-        # unpack
-        #x, x_surf = self.split_and_reshape(x)
         return x
     
     def forward(self, x):
         z = self.encode(x)
             
         if self.use_codebook:
-            x, cm_loss = self.decode(z)
-            return x, cm_loss
+            z, indices, commit_loss = self.vq(z)
+            x = self.decode(z)
+            return x, commit_loss
             
         x = self.decode(z)    
         return x
@@ -262,6 +270,11 @@ class ViT2D(nn.Module):
         tensor2 = tensor[:, -int(self.surface_channels):, :, :]
         tensor1 = tensor1.view(tensor1.shape[0], self.channels, self.frames, tensor1.shape[2], tensor1.shape[3])
         return tensor1, tensor2
+    
+    def codebook(self):
+        if self.use_codebook:
+            return self.vq.codebook
+        return None
 
 
 
